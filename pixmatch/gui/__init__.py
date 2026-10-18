@@ -201,7 +201,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mark_delete_folder_menu = QtGui.QAction("Delete Folder", self)
         mark_ignore = QtGui.QAction("Ignore", self)
         mark_ignore_group = QtGui.QAction("Ignore Group", self)
-        mark_ignore_folder = QtGui.QAction("Ignore Folder", self)
         self.mark_ignore_zip_menu = QtGui.QAction("Ignore Zip", self)
         self.mark_move_menu = QtGui.QAction("Move this file...", self)
         mark_symlink = QtGui.QAction("Symlink this file...", self, enabled=False)
@@ -216,7 +215,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mark_move_menu.triggered.connect(self.mark_move)
         mark_ignore.triggered.connect(self.mark_ignore)
         mark_ignore_group.triggered.connect(self.mark_ignore_group)
-        mark_ignore_folder.triggered.connect(self.mark_ignore_folder)
         self.mark_ignore_zip_menu.triggered.connect(self.mark_ignore_zip)
         unmark.triggered.connect(self.mark_unmark)
         unmark_group.triggered.connect(self.mark_unmark_group)
@@ -230,7 +228,6 @@ class MainWindow(QtWidgets.QMainWindow):
         edit_menu.addSeparator()
         edit_menu.addAction(mark_ignore)
         edit_menu.addAction(mark_ignore_group)
-        edit_menu.addAction(mark_ignore_folder)
         edit_menu.addAction(self.mark_ignore_zip_menu)
         edit_menu.addSeparator()
         edit_menu.addAction(self.mark_move_menu)
@@ -538,7 +535,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.duplicate_group_list.groupTileDeleteFolder.connect(self.mark_delete_folder)
         self.duplicate_group_list.groupTileIgnoreGroup.connect(self.mark_ignore_group)
         self.duplicate_group_list.groupTileIgnoreColumn.connect(self.mark_ignore_column)
-        self.duplicate_group_list.groupTileIgnoreFolder.connect(self.mark_ignore_folder)
         self.duplicate_group_list.groupTileIgnoreZip.connect(self.mark_ignore_zip)
         self.duplicate_group_list.groupTileUnmarkGroup.connect(self.mark_unmark_group)
         self.duplicate_group_list.groupTileUnmarkColumn.connect(self.mark_unmark_column)
@@ -1117,10 +1113,6 @@ class MainWindow(QtWidgets.QMainWindow):
             path = path.parent
 
         self.mark_paths((p for p in self.processor._reverse_hashes if p.path_obj.parent == path), selection)
-
-    def mark_ignore_folder(self, target_path: ZipPath | None = None):
-        """Mark all files in a folder as ignore"""
-        self.mark_folder(target_path or self.image_view_area.current_path, SelectionValues.IGNORE)
 
     def mark_delete_folder(self, target_path: ZipPath | None = None):
         """Mark all files in a folder as delete"""

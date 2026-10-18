@@ -620,7 +620,6 @@ class ThumbnailTile(QtWidgets.QFrame):
     deleteFolder = QtCore.Signal(ZipPath)
     ignoreGroup = QtCore.Signal(ZipPath)
     ignoreColumn = QtCore.Signal(ZipPath)
-    ignoreFolder = QtCore.Signal(ZipPath)
     ignoreZip = QtCore.Signal(ZipPath)
     unmarkGroup = QtCore.Signal(ZipPath)
     unmarkColumn = QtCore.Signal(ZipPath)
@@ -664,7 +663,6 @@ class ThumbnailTile(QtWidgets.QFrame):
         act_ignore = self.context_menu.addAction("Ignore")
         act_ignore_group = self.context_menu.addAction("Ignore group")
         act_ignore_column = self.context_menu.addAction("Ignore column")
-        act_ignore_folder = self.context_menu.addAction("Ignore folder")
         act_ignore_zip = self.context_menu.addAction("Ignore zip")
         self.context_menu.addSeparator()
         act_move = self.context_menu.addAction("Move this file")
@@ -692,7 +690,6 @@ class ThumbnailTile(QtWidgets.QFrame):
         act_delete_folder.triggered.connect(self.on_delete_folder)
         act_ignore_group.triggered.connect(self.on_ignore_group)
         act_ignore_column.triggered.connect(self.on_ignore_column)
-        act_ignore_folder.triggered.connect(self.on_ignore_folder)
         act_ignore_zip.triggered.connect(self.on_ignore_zip)
         act_unmark_group.triggered.connect(self.on_unmark_group)
         act_unmark_column.triggered.connect(self.on_unmark_column)
@@ -727,10 +724,6 @@ class ThumbnailTile(QtWidgets.QFrame):
     def on_ignore_column(self):
         """Ignore column button pressed, so emit"""
         self.ignoreColumn.emit(self._path)
-
-    def on_ignore_folder(self):
-        """Ignore folder button pressed, so emit"""
-        self.ignoreFolder.emit(self._path)
 
     def on_ignore_zip(self):
         """Ignore zip button pressed, so emit"""
@@ -867,7 +860,6 @@ class DuplicateGroupRow(QtWidgets.QWidget):
     tileDeleteFolder = QtCore.Signal(ZipPath)
     tileIgnoreGroup = QtCore.Signal(ZipPath)
     tileIgnoreColumn = QtCore.Signal(int)
-    tileIgnoreFolder = QtCore.Signal(ZipPath)
     tileIgnoreZip = QtCore.Signal(ZipPath)
     tileUnmarkGroup = QtCore.Signal(ZipPath)
     tileUnmarkColumn = QtCore.Signal(int)
@@ -910,7 +902,6 @@ class DuplicateGroupRow(QtWidgets.QWidget):
         tile.deleteFolder.connect(self.tileDeleteFolder)
         tile.ignoreGroup.connect(self.tileIgnoreGroup)
         tile.ignoreColumn.connect(self.on_mark_ignore_column)
-        tile.ignoreFolder.connect(self.tileIgnoreFolder)
         tile.ignoreZip.connect(self.tileIgnoreZip)
         tile.unmarkGroup.connect(self.tileUnmarkGroup)
         tile.unmarkColumn.connect(self.on_unmark_column)
@@ -988,7 +979,6 @@ class DuplicateGroupList(QtWidgets.QWidget):
     groupTileDeleteFolder = QtCore.Signal(ZipPath)
     groupTileIgnoreGroup = QtCore.Signal(ZipPath)
     groupTileIgnoreColumn = QtCore.Signal(int)
-    groupTileIgnoreFolder = QtCore.Signal(ZipPath)
     groupTileIgnoreZip = QtCore.Signal(ZipPath)
     groupTileUnmarkGroup = QtCore.Signal(ZipPath)
     groupTileUnmarkColumn = QtCore.Signal(int)
@@ -1076,7 +1066,6 @@ class DuplicateGroupList(QtWidgets.QWidget):
         row.tileDeleteFolder.connect(self.groupTileDeleteFolder)
         row.tileIgnoreGroup.connect(self.groupTileIgnoreGroup)
         row.tileIgnoreColumn.connect(self.groupTileIgnoreColumn)
-        row.tileIgnoreFolder.connect(self.groupTileIgnoreFolder)
         row.tileIgnoreZip.connect(self.groupTileIgnoreZip)
         row.tileUnmarkGroup.connect(self.groupTileUnmarkGroup)
         row.tileUnmarkColumn.connect(self.groupTileUnmarkColumn)
