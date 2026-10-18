@@ -3,7 +3,7 @@ import logging
 import os
 import time
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from functools import wraps
 from itertools import combinations
@@ -11,7 +11,7 @@ from multiprocessing import Pool
 from os import cpu_count
 from pathlib import Path
 from queue import Queue
-from threading import Event
+from threading import Event, Semaphore
 from typing import ClassVar
 from zipfile import BadZipFile, ZipFile
 
@@ -780,6 +780,20 @@ class ImageMatcher:
         self.processed_images += 1
         logger.error("%s: %s (input path %s)", type(e).__name__, e, e.input_path)
 
+    def _task_done(self, result):
+        """A worker finished hashing a file, so handle it and free its slot"""
+        try:
+            self._process_image_callback(result)
+        finally:
+            self._task_slots.release()
+
+    def _task_failed(self, e):
+        """A worker failed to hash a file, so log it and free its slot"""
+        try:
+            self._process_image_error_callback(e)
+        finally:
+            self._task_slots.release()
+
     def _root_stream(self):
         """This is to yield any paths for processing, then wait until processing is finished for any new paths"""
         while not self._new_paths.empty() or self.left_to_process:
@@ -799,6 +813,33 @@ class ImageMatcher:
 
         for path in paths:
             self.add_path(path)
+
+        # Only a few files per worker are handed to the pool at a time, and the rest wait in `pending`.
+        #   Stopping then only has to wait for those few, and can close the pool normally: terminating it while
+        #   workers are sending results can fail (on Windows, "concurrent send_bytes() calls"), which would
+        #   leave processing never finishing.
+        self._task_slots = Semaphore((self.processes or cpu_count() or 1) * 4)
+        pending = deque()
+
+        def submit(*, wait: bool):
+            """Hand pending files to the pool while there are free slots, or until all are handed over if wait"""
+            while pending and not self.is_finished():
+                if not self._task_slots.acquire(timeout=0.1 if wait else 0):
+                    if wait:
+                        continue
+                    return
+
+                tp.apply_async(
+                    _process_image,
+                    args=(pending.popleft(), ),
+                    kwds={
+                        'supported_extensions': self.extensions,
+                        'exact_match': self.exact_match,
+                        'draft': self.radius >= DRAFT_RADIUS,
+                    },
+                    callback=self._task_done,
+                    error_callback=self._task_failed,
+                )
 
         with Pool(self.processes) as tp:
             for path in self._root_stream():
@@ -844,25 +885,19 @@ class ImageMatcher:
                             continue
 
                         self.found_images += 1
-                        tp.apply_async(
-                            _process_image,
-                            args=(f, ),
-                            kwds={
-                                'supported_extensions': self.extensions,
-                                'exact_match': self.exact_match,
-                                'draft': self.radius >= DRAFT_RADIUS,
-                            },
-                            callback=self._process_image_callback,
-                            error_callback=self._process_image_error_callback,
-                        )
+                        pending.append(f)
+                        submit(wait=False)
 
+                # Everything under this path is found, so hand the rest over before waiting for it to finish
+                submit(wait=True)
+
+            # If processing was stopped, the files still pending were never hashed. The few the pool has are
+            #   finished first (their results are thrown away), so the pool can be closed instead of terminated.
+            pending.clear()
             tp.close()
+            tp.join()
 
-            if not self.is_finished():
-                tp.join()
-
-        # Leaving the pool terminates it, so if processing was stopped, whatever was still queued was never hashed.
-        #   Forget about those files so the counts are right, and the next run finds them again.
+        # Forget about files that were found but not hashed, so the counts are right and the next run finds them again
         self.found_images = self.processed_images
         self._finished.set()
         self.events.put(Finished())

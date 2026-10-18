@@ -1459,8 +1459,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 event.ignore()
                 return
 
-            if self.processor.running():
-                self.processor.finish()
+            if not self.processor.is_finished():
+                # Stop, not finish: a paused scan has to wake up to stop, or closing would wait on it forever
+                self.processor.stop()
 
         event.accept()
 
