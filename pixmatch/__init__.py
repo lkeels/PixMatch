@@ -86,7 +86,7 @@ STRENGTH_RADIUS = (8, 8, 8, 6, 6, 4, 4, 2, 2, 0, 0)
 DRAFT_RADIUS = 4
 
 
-def calculate_hashes(f, *, is_gif=False, exact_match=False, draft=False) -> tuple[int | str, set[int]]:
+def calculate_hashes(f, *, is_gif=False, exact_match=False, draft=False) -> tuple[int | str, set[int], bytes | None]:
     """
     Calculate hashes for a given file.
 
@@ -99,9 +99,11 @@ def calculate_hashes(f, *, is_gif=False, exact_match=False, draft=False) -> tupl
         draft (bool): Decode JPEGs at a reduced size? Much faster, but can change the hash by a couple bits.
 
     Returns:
-        tuple[int | str, set]: The first element is the primary hash,
+        tuple[int | str, set, bytes | None]: The first element is the primary hash,
             the second element are any secondary hashes representing rotations, flips, etc...
             Perceptual hashes are 64-bit ints, and the SHA256 hash is a hex string (with no secondary hashes).
+            The third element are the centre hashes (see phash.centre_hashes), for finding copies turned by a few
+            degrees. None for SHA256 hashes, and images with a blank middle.
     """
     if exact_match:
         hasher = hashlib.sha256()
@@ -109,15 +111,17 @@ def calculate_hashes(f, *, is_gif=False, exact_match=False, draft=False) -> tupl
         with (open(f, "rb") if isinstance(f, (str, Path)) else f) as file:  # ruff: ignore[builtin-open]
             for block in iter(lambda: file.read(block_size), b""):
                 hasher.update(block)
-        return hasher.hexdigest(), set()
+        return hasher.hexdigest(), set(), None
 
     with Image.open(f) as im:
         if draft:
             # JPEGs can be decoded at 1/2 to 1/8 of their size (and straight to grayscale), which is several times
             #   faster than decoding all of a large photo just to shrink it. This does nothing for other formats.
+            #   It leaves the short side at least CENTRE_WORK pixels, so the centre hashes lose nothing either.
             im.draft("L", (phash.HASH_IMG_SIZE * 4, phash.HASH_IMG_SIZE * 4))
         orientation = im.getexif().get(phash.EXIF_ORIENTATION_TAG, 1)
-        px = phash.grayscale_pixels(im, phash.HASH_IMG_SIZE)
+        gray = phash.grayscale(im)
+        px = phash.resized_pixels(gray, phash.HASH_IMG_SIZE)
         if is_gif:
             # Some animations start with a blank frame (nothing, or only a single color). Its hash would be noise
             #   that happens to be shared by other blank frames, so use the first frame that has something in it.
@@ -127,20 +131,27 @@ def calculate_hashes(f, *, is_gif=False, exact_match=False, draft=False) -> tupl
                 except EOFError:  # ruff: ignore[try-except-in-loop]
                     break
                 else:
-                    px = phash.grayscale_pixels(im, phash.HASH_IMG_SIZE)
+                    gray = phash.grayscale(im)
+                    px = phash.resized_pixels(gray, phash.HASH_IMG_SIZE)
+
+    centre = phash.centre_array(gray)
+    width, height = gray.size
 
     # Hash the image the way it is displayed, not the way it is stored
     if orientation in phash.EXIF_ORIENTATIONS:
         px = phash.EXIF_ORIENTATIONS[orientation](px)
+        centre = phash.EXIF_ORIENTATIONS[orientation](centre)
+        if orientation >= 5:  # These turn it a quarter, so it's displayed with its width and height swapped
+            width, height = height, width
 
     if phash.is_flat(px):
-        return phash.FLAT_HASH, set()
+        return phash.FLAT_HASH, set(), None
 
     # All the rotations and mirrors are made from the one small resized array, which is far cheaper than
     #   transforming the full size image. For GIFs we'll look for mirrored versions but thats it
     variants = (px, np.fliplr(px)) if is_gif else tuple(phash.orientations(px))
     initial_hash, *extras = (phash.phash(variant) for variant in variants)
-    return initial_hash, set(extras)
+    return initial_hash, set(extras), phash.centre_hashes(np.ascontiguousarray(centre), width, height)
 
 
 def thread_error_handler(func):
@@ -318,6 +329,22 @@ class HammingIndex:
         return found
 
 
+class CentreIndex(HammingIndex):
+    """
+    A HammingIndex for centre hashes, which are only matched within CENTRE_RADIUS bits.
+
+    Each image looks itself up with every one of its centre hash queries, so lookups need to be cheap. With 5 chunks
+    and a radius of 4, some chunk of a match is identical, so each lookup is only 5 table lookups.
+    """
+    CHUNKS = 5
+
+
+# The most bits an image's centre hash queries can differ from another image's centre hash for it to be a turned copy.
+#   From testing: copies turned 3-12 degrees, on the same or a bigger canvas, land within 0-4 bits.
+#   Unrelated images were 12 or more apart.
+CENTRE_RADIUS = 4
+
+
 class ImageMatcher:
     """
     An image matching SDK
@@ -329,11 +356,13 @@ class ImageMatcher:
             If True, strength must be 10.
         processes (int): The number of processes to use. Defaults to None.
         extensions (set): The extensions to process. Optional.
+        rotation (bool): Also match copies turned by a few degrees (by their centre hashes)?
+            Centre hashes are always calculated, so `regroup` can turn this on or off. Ignored for SHA-256 hashes.
     """
     SUPPORTED_EXTS: ClassVar = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".bmp", ".gif", ".zip"}
 
     def __init__(self, strength: int = 5, processes: int | None = None, extensions: set | None = None,
-                 *, exact_match: bool = False):
+                 *, exact_match: bool = False, rotation: bool = False):
         if not (0 <= strength <= 10):
             raise ValueError("Strength must be between 0 and 10!")
 
@@ -358,6 +387,20 @@ class ImageMatcher:
         self._processed_zips = {}  # Zips that have been successfully processed
         self._hashes = defaultdict(ImageMatch)  # Hash -> Paths
         self._reverse_hashes = {}  # Path -> Hash
+
+        # Path -> (the order it was matched in, its own hashes with the initial orientation first, its centre hashes).
+        #   _reverse_hashes only has the hash of the group each image joined, so these are what let `regroup`
+        #   match everything again at another strength without hashing any of it again.
+        self._image_hashes = {}
+        self._next_order = 0
+
+        # Matching turned copies: every loaded image's centre hashes are in _centre_index, and _centre_paths says
+        #   which images have each of them. Not just each group's first image: that could be a quarter turn of
+        #   the original, which no small angle matches, while another image in the group isn't.
+        self.rotation = rotation and not exact_match
+        self._centre_index = CentreIndex(CENTRE_RADIUS)
+        self._centre_paths = {}  # Centre hash -> set of paths
+        self._path_centres = {}  # Path -> its centre hashes (and its mirror's)
 
         # Finds the hashes of _hashes that are close to an image's hashes. Not needed if they must be identical
         self._index = HammingIndex(self.radius) if self.radius and not exact_match else None
@@ -451,6 +494,8 @@ class ImageMatcher:
         paused = self.conditional_pause()
 
         hash_ = self._reverse_hashes.pop(path)
+        self._image_hashes.pop(path, None)
+        self._remove_path_centres(path)
         self._hashes[hash_].matches.remove(path)
         if len(self._hashes[hash_].matches) == 1:
             match_i = self._hashes[hash_].match_i
@@ -499,6 +544,11 @@ class ImageMatcher:
 
             hash_ = self._reverse_hashes.pop(old_path)
             self._reverse_hashes[new_path] = hash_
+            self._image_hashes[new_path] = self._image_hashes.pop(old_path)  # Keeps its order for regrouping
+            if old_path in self._path_centres:
+                stored = self._path_centres[old_path]
+                self._remove_path_centres(old_path)
+                self._add_path_centres(new_path, stored)
 
             # Replace it in place, so the file keeps its position (column) in its group
             matches = self._hashes[hash_].matches
@@ -511,12 +561,14 @@ class ImageMatcher:
         for match_i, match in enumerate(self.matches[start:], start=start):
             match.match_i = match_i
 
-    def _find_group(self, hashes: set) -> int | str | None:
+    def _find_group(self, hashes: set, centre: bytes | None = None) -> int | str | None:
         """
         Find the group an image belongs to.
 
         Args:
             hashes (set): All of the image's hashes (every rotation and mirror of it).
+            centre (bytes | None): The image's centre hashes. Only used if rotation is on, and no group matched
+                the image as a whole.
 
         Returns:
             int | str | None: The key in _hashes of the closest group, or None if no group is close enough.
@@ -525,15 +577,55 @@ class ImageMatcher:
             # From testing at ~1.5m loaded images: it is ~10% faster to return a set and do this than it is to
             #   iterate over a list and do an `is in` check for each hash
             found_hashes = self._hashes.keys() & hashes
-            return min(found_hashes) if found_hashes else None
+            if found_hashes:
+                return min(found_hashes)
+        else:
+            closest = None
+            for hash_ in hashes:
+                for found_hash, distance in self._index.find(hash_).items():
+                    if closest is None or (distance, found_hash) < closest:
+                        closest = (distance, found_hash)
 
+            if closest is not None:
+                return closest[1]
+
+        if not self.rotation or centre is None:
+            return None
+
+        # Nothing matched it as a whole, so is it a turned copy of a loaded image (or the other way around)?
+        #   Only the turned queries are looked up, and an image only counts if turning explains the match better than
+        #   not turning: an image whose middle matches as is (a recolored copy, say) is up to the strength to match.
+        as_is, *turned = phash.unpack_centre_hashes(centre)[1]
         closest = None
-        for hash_ in hashes:
-            for found_hash, distance in self._index.find(hash_).items():
-                if closest is None or (distance, found_hash) < closest:
-                    closest = (distance, found_hash)
+        for query in turned:
+            for found_centre, distance in self._centre_index.find(query).items():
+                for found_path in self._centre_paths[found_centre]:
+                    key = self._reverse_hashes[found_path]
+                    if closest is not None and (distance, key) >= closest:
+                        continue
+
+                    if distance < min((as_is ^ stored).bit_count() for stored in self._path_centres[found_path]):
+                        closest = (distance, key)
 
         return None if closest is None else closest[1]
+
+    def _add_path_centres(self, path: ZipPath, stored: tuple[int, int]):
+        """This image is loaded, so turned copies of it can find its group by its centre hashes"""
+        self._path_centres[path] = stored
+        for centre_hash in set(stored):
+            paths = self._centre_paths.setdefault(centre_hash, set())
+            if not paths:
+                self._centre_index.add(centre_hash)
+            paths.add(path)
+
+    def _remove_path_centres(self, path: ZipPath):
+        """This image is gone, so stop finding anything by its centre hashes"""
+        for centre_hash in set(self._path_centres.pop(path, ())):
+            paths = self._centre_paths[centre_hash]
+            paths.discard(path)
+            if not paths:
+                del self._centre_paths[centre_hash]
+                self._centre_index.remove(centre_hash)
 
     def _process_image_callback(self, result):
         """
@@ -577,7 +669,7 @@ class ImageMatcher:
             self._processed_zips[str(path)] = subpaths
             return
 
-        initial_hash, extra_hashes = hashes
+        initial_hash, extra_hashes, centre = hashes
         extra_hashes.add(initial_hash)
         if not isinstance(path, ZipPath):
             # From this point on, EVERYTHING should be a ZipPath
@@ -589,8 +681,23 @@ class ImageMatcher:
             return
 
         self.processed_images += 1
+        self._image_hashes[path] = (self._next_order, (initial_hash, *(extra_hashes - {initial_hash})), centre)
+        self._next_order += 1
+        self._add_image(path, initial_hash, extra_hashes, centre)
 
-        hash_ = self._find_group(extra_hashes)
+    def _add_image(self, path: ZipPath, initial_hash: int | str, hashes: set, centre: bytes | None = None, *,
+                   emit: bool = True):
+        """
+        Put an image in the group it matches, or in a group of its own if it matches none.
+
+        Args:
+            path (ZipPath): The image.
+            initial_hash (int | str): The hash of the image as displayed.
+            hashes (set): All of the image's hashes, including initial_hash.
+            centre (bytes | None): The image's centre hashes, for matching turned copies.
+            emit (bool): Send events for new groups and matches? Regrouping doesn't, the GUI redraws everything.
+        """
+        hash_ = self._find_group(hashes, centre)
         if hash_ is None:
             # This is a new image not matching any previous, so just add it to the hashmap and move on...
             #   Just use the initial orientation
@@ -599,26 +706,74 @@ class ImageMatcher:
             self._hashes[hash_].matches.append(path)
             if self._index is not None:
                 self._index.add(hash_)
+            if self.rotation and centre is not None:
+                self._add_path_centres(path, phash.unpack_centre_hashes(centre)[0])
             return
 
         # We have found a match!
         self._reverse_hashes[path] = hash_
         self._hashes[hash_].matches.append(path)
+        if self.rotation and centre is not None:
+            self._add_path_centres(path, phash.unpack_centre_hashes(centre)[0])
 
         if self._hashes[hash_].match_i is None and len(self._hashes[hash_].matches) >= 2:
             # This is a brand new match group!
             self._hashes[hash_].match_i = len(self.matches)
             self.matches.append(self._hashes[hash_])
             self.duplicate_images += 2
-            self.events.put(NewGroup(self._hashes[hash_].snapshot()))
-            logger.debug('New match group found: %s', self._hashes[hash_].matches)
+            if emit:
+                self.events.put(NewGroup(self._hashes[hash_].snapshot()))
+                logger.debug('New match group found: %s', self._hashes[hash_].matches)
         else:
             # Just another match for an existing group...
             self.duplicate_images += 1
-            self.events.put(NewMatch(self._hashes[hash_].snapshot(), path))
-            logger.debug('New match found for group #%s: %s',
-                         self._hashes[hash_].match_i,
-                         self._hashes[hash_].matches)
+            if emit:
+                self.events.put(NewMatch(self._hashes[hash_].snapshot(), path))
+                logger.debug('New match found for group #%s: %s',
+                             self._hashes[hash_].match_i,
+                             self._hashes[hash_].matches)
+
+    def regroup(self, strength: int, *, rotation: bool | None = None):
+        """
+        Group the loaded images again at another strength (or with rotation on or off), without hashing them again.
+
+        Images are matched in the same order they were the first time, with the same logic, so the groups are what
+            matching at this strength would have made from the same hashes.
+        Processing must be finished (or stopped) first, since this rebuilds everything the callbacks write to.
+
+        Args:
+            strength (int): The 0-10 strength to group at.
+            rotation (bool | None): Match copies turned by a few degrees? None leaves it as it is.
+
+        Raises:
+            ValueError: The strength is out of range, or the images have SHA-256 hashes, which only match identical
+                files at any strength.
+            RuntimeError: Processing is still running.
+        """
+        if not (0 <= strength <= 10):
+            raise ValueError("Strength must be between 0 and 10!")
+
+        if self.exact_match:
+            raise ValueError("SHA-256 hashes only match identical files, so they can't be grouped at another strength")
+
+        if not self.is_finished():
+            raise RuntimeError("Can't regroup while processing is running")
+
+        self.strength = strength
+        self.radius = STRENGTH_RADIUS[strength]
+        if rotation is not None:
+            self.rotation = rotation
+        self.matches = []
+        self.duplicate_images = 0
+        self._hashes = defaultdict(ImageMatch)
+        self._reverse_hashes = {}
+        self._index = HammingIndex(self.radius) if self.radius else None
+        self._centre_index = CentreIndex(CENTRE_RADIUS)
+        self._centre_paths = {}
+        self._path_centres = {}
+
+        for path, (_, hashes, centre) in sorted(self._image_hashes.items(), key=lambda item: item[1][0]):
+            self._add_image(path, hashes[0], set(hashes), centre, emit=False)
 
     def _process_image_error_callback(self, e):
         """Temporary for testing"""
@@ -628,6 +783,9 @@ class ImageMatcher:
     def _root_stream(self):
         """This is to yield any paths for processing, then wait until processing is finished for any new paths"""
         while not self._new_paths.empty() or self.left_to_process:
+            if self.is_finished():
+                return
+
             if self._new_paths.empty():
                 time.sleep(0.05)
                 continue
@@ -703,6 +861,14 @@ class ImageMatcher:
             if not self.is_finished():
                 tp.join()
 
-        if not self.is_finished():
-            self._finished.set()
-            self.events.put(Finished())
+        # Leaving the pool terminates it, so if processing was stopped, whatever was still queued was never hashed.
+        #   Forget about those files so the counts are right, and the next run finds them again.
+        self.found_images = self.processed_images
+        self._finished.set()
+        self.events.put(Finished())
+
+    def stop(self):
+        """Stop processing. The images hashed so far are kept, and running again picks up the rest"""
+        logger.debug('Performing stop')
+        self._finished.set()
+        self._not_paused.set()  # Anything waiting out a pause has to wake up to see that it should stop

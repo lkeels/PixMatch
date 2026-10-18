@@ -3,6 +3,7 @@
 
 import logging
 import shutil
+import time
 
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -93,6 +94,35 @@ class ProcessorThread(QtCore.QRunnable):
     def run(self):
         """Execute the processor"""
         self.processor.run(*self.args, **self.kwargs)
+
+
+class RegroupSignals(QtCore.QObject):
+    """Signals from a running regroup, with how many seconds it took"""
+
+    done = QtCore.Signal(float)
+    failed = QtCore.Signal(str)
+
+
+class RegroupThread(QtCore.QRunnable):
+    """Regroups the processor's images at another strength (or with rotation on or off) off of the GUI thread"""
+
+    def __init__(self, processor: ImageMatcher, strength: int, *, rotation: bool):
+        super().__init__()
+        self.processor = processor
+        self.strength = strength
+        self.rotation = rotation
+        self.signals = RegroupSignals()
+
+    def run(self):
+        """Do the regroup"""
+        start = time.perf_counter()
+        try:
+            self.processor.regroup(self.strength, rotation=self.rotation)
+        except Exception as e:
+            logger.exception("Regrouping at strength %s failed", self.strength)
+            self.signals.failed.emit(f"{type(e).__name__}: {e}")
+        else:
+            self.signals.done.emit(time.perf_counter() - start)
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -333,7 +363,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stop_btn.setCheckable(True)
         self.stop_btn.setChecked(True)
         self.stop_btn.setStyleSheet('QPushButton {font-size: 26pt; color: maroon;}')
-        self.stop_btn.clicked.connect(self.on_pause)
+        self.stop_btn.clicked.connect(self.on_stop)
 
         self.start_btn = QtWidgets.QPushButton("\u25B6")
         self.start_btn.setSizePolicy(MAX_SIZE_POLICY)
@@ -413,6 +443,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.precision_slider.setMaximum(10)
         self.precision_slider.setValue(5)
         self.precision_slider.valueChanged.connect(self.on_precision_adjust)
+        self.precision_slider.sliderReleased.connect(self.schedule_regroup)
+
+        # Wait for the slider to settle before regrouping, so keying or scrolling through it only regroups once
+        self._regroup_timer = QtCore.QTimer(self, singleShot=True, interval=300)
+        self._regroup_timer.timeout.connect(self.start_regroup)
+        self._regrouping = False
+        self._regroup_failed = False
 
         filter_tab_main = QtWidgets.QHBoxLayout()
         filter_tab_main.setContentsMargins(NO_MARGIN)
@@ -434,7 +471,17 @@ class MainWindow(QtWidgets.QMainWindow):
         filter_tab = QtWidgets.QVBoxLayout()
         self.hash_match_chkbx = QtWidgets.QCheckBox(" Hash match")
         self.hash_match_chkbx.setEnabled(False)
-        filter_tab.addWidget(self.hash_match_chkbx)
+        self.hash_match_chkbx.toggled.connect(self.on_hash_match_toggled)
+        self.rotation_chkbx = QtWidgets.QCheckBox(" Rotation")
+        self.rotation_chkbx.setToolTip("Also match copies turned by a few degrees (up to about 12).\n"
+                                       "Slower to match, especially with many images.")
+        self.rotation_chkbx.toggled.connect(self.schedule_regroup)
+        filter_checkboxes = QtWidgets.QHBoxLayout()
+        filter_checkboxes.setContentsMargins(NO_MARGIN)
+        filter_checkboxes.addWidget(self.hash_match_chkbx)
+        filter_checkboxes.addWidget(self.rotation_chkbx)
+        filter_checkboxes.addStretch()
+        filter_tab.addLayout(filter_checkboxes)
         filter_tab.addLayout(filter_tab_main)
         # endregion
 
@@ -531,12 +578,134 @@ class MainWindow(QtWidgets.QMainWindow):
         self.update_labels()
 
     def on_precision_adjust(self, e):
-        """The precision slider has been adjusted, so update the hash checkbox"""
+        """The precision slider has been adjusted, so update the hash checkbox and regroup"""
         if e != 10:
             self.hash_match_chkbx.setEnabled(False)
             self.hash_match_chkbx.setChecked(False)
         else:
             self.hash_match_chkbx.setEnabled(True)
+
+        self.schedule_regroup()
+
+    def on_hash_match_toggled(self, checked: bool):  # ruff: ignore[boolean-type-hint-positional-argument]
+        """SHA-256 hashes only match identical files, so they can't find turned copies"""
+        self.rotation_chkbx.setEnabled(not checked and self.precision_slider.isEnabled())
+        self.schedule_regroup()
+
+    def rotation_wanted(self) -> bool:
+        """Should turned copies be matched, with the settings that are set now?"""
+        return self.rotation_chkbx.isChecked() and not self.hash_match_chkbx.isChecked()
+
+    def _scan_matches_settings(self) -> bool:
+        """Was the loaded scan made with the strength, Hash match and Rotation settings that are set now?"""
+        return (self.processor.strength == self.precision_slider.value()
+                and self.processor.exact_match == self.hash_match_chkbx.isChecked()
+                and self.processor.rotation == self.rotation_wanted())
+
+    def schedule_regroup(self, *_):
+        """The filter settings changed, so regroup what was loaded once they settle"""
+        if not self.processor or not self.processor.is_finished() or self.precision_slider.isSliderDown():
+            return
+
+        self._regroup_timer.start()
+
+    def start_regroup(self):
+        """Regroup the loaded images at the strength now set, if they can be"""
+        if not self.processor or not self.processor.is_finished() or self._regrouping:
+            return
+
+        if self._scan_matches_settings():
+            self.statusBar().clearMessage()
+            return
+
+        if self.processor.exact_match or self.hash_match_chkbx.isChecked():
+            # SHA-256 hashes and perceptual hashes can't be turned into each other, only a new scan can switch them
+            self.statusBar().showMessage("Press start to scan again with the new Hash match setting.")
+            return
+
+        strength = self.precision_slider.value()
+        rotation = self.rotation_wanted()
+        logger.info("Regrouping %s images at strength %s, rotation %s",
+                    self.processor.processed_images, strength, rotation)
+        self.statusBar().showMessage(f"Regrouping at strength {strength}{' with rotation' if rotation else ''}...")
+
+        # Everything that reads or changes the processor's groups waits until the regroup is done
+        self._regrouping = True
+        self.centralWidget().setEnabled(False)
+        self.menuBar().setEnabled(False)
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+
+        regroup = RegroupThread(self.processor, strength, rotation=rotation)
+        regroup.signals.done.connect(self.on_regroup_done)
+        regroup.signals.failed.connect(self.on_regroup_failed)
+        self._regroup_thread = regroup  # The signals must outlive run() until they're delivered
+        self._threadpool.start(regroup)
+
+    def _end_regroup(self):
+        """Give the GUI back after a regroup"""
+        self._regrouping = False
+        self._regroup_thread = None
+        QtWidgets.QApplication.restoreOverrideCursor()
+        self.centralWidget().setEnabled(True)
+        self.menuBar().setEnabled(True)
+
+    def on_regroup_done(self, seconds: float):
+        """The regroup finished, so show the new groups"""
+        self._end_regroup()
+
+        # A file is only marked for delete or move while it has a duplicate (see set_file_state).
+        #   Some files lost theirs at this strength, so those markings no longer apply
+        self.file_states = {
+            path: state for path, state in self.file_states.items()
+            if state.state not in {SelectionState.DELETE, SelectionState.MOVE} or self._has_duplicate(path)
+        }
+
+        self.current_page = 1
+        self.update_group_list()
+        self.update_labels()
+        self.statusBar().showMessage(
+            f"Regrouped at strength {self.processor.strength}{' with rotation' if self.processor.rotation else ''}: "
+            f"{len(self.processor.matches)} groups in {seconds:.1f}s.",
+        )
+
+        # The slider may have moved again while this ran
+        if not self._scan_matches_settings():
+            self.start_regroup()
+
+    def on_regroup_failed(self, error: str):
+        """The regroup failed, which leaves the groups half built, so it's the next scan's turn"""
+        self._end_regroup()
+        self._regroup_failed = True
+        self.statusBar().showMessage(f"Regrouping failed ({error}), press start to scan again.")
+
+    def confirm_new_scan(self) -> bool:
+        """
+        Ask before starting a new scan that would throw out the loaded one.
+
+        Returns:
+            True if the user wants the new scan.
+        """
+        answer = QtWidgets.QMessageBox.question(
+            self,
+            "New scan?",
+            "The loaded images can't be regrouped with these settings, so they need to be scanned again.\n"
+            "This clears the current groups and any marked files. Continue?",
+            defaultButton=QtWidgets.QMessageBox.StandardButton.No,
+        )
+        return answer == QtWidgets.QMessageBox.StandardButton.Yes
+
+    def reset_scan(self):
+        """Throw out the loaded scan, its groups and its markings"""
+        self.processor = None
+        self._regroup_failed = False
+        self.file_states = {}
+        self.current_page = 1
+        self._elapsed_secs = 0
+        self._timer_label.setText("00:00:00")
+        self.image_view_area.clear()
+        self.duplicate_group_list.set_groups([])
+        self.duplicate_group_list.update_page_indicator(1, 1)
+        self.statusBar().clearMessage()
 
     def on_pause(self, e):
         """Pause button has been pressed, so pause"""
@@ -550,16 +719,35 @@ class MainWindow(QtWidgets.QMainWindow):
         self._run_timer.stop()
         self._label_timer.stop()
 
+    def on_stop(self, e):
+        """Stop button has been pressed, so stop processing. on_finish updates the GUI once it has stopped"""
+        if not e:
+            return
+
+        if self.processor and not self.processor.is_finished():
+            self.pause_btn.setEnabled(False)
+            self.processor.stop()
+
     def on_start(self, e):
         """Start button has been pressed, so start or resume"""
         if not e:
             return
+
+        if self.processor and self.processor.is_finished() and (
+                self._regroup_failed or self.processor.exact_match != self.hash_match_chkbx.isChecked()):
+            # The loaded hashes can't be used with these settings, so this has to be a whole new scan
+            if not self.confirm_new_scan():
+                self.stop_btn.setChecked(True)
+                return
+
+            self.reset_scan()
 
         if not self.processor:
             # This is the first time running!
             self.processor = ImageMatcher(
                 strength=self.precision_slider.value(),
                 exact_match=self.hash_match_chkbx.isChecked(),
+                rotation=self.rotation_wanted(),
             )
 
         elif self.processor.is_paused() and not self.processor.is_finished():
@@ -583,6 +771,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pause_btn.setEnabled(True)
         self.precision_slider.setEnabled(False)
         self.hash_match_chkbx.setEnabled(False)
+        self.rotation_chkbx.setEnabled(False)
         self._run_timer.start()
         self._label_timer.start()
         return
@@ -616,6 +805,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._label_timer.stop()
         self._thread = None
         self.update_labels()
+
+        # The strength and rotation can be changed again now, which regroups what was loaded
+        self.precision_slider.setEnabled(True)
+        self.rotation_chkbx.setEnabled(not self.hash_match_chkbx.isChecked())
+        self.on_precision_adjust(self.precision_slider.value())
 
     def on_new_match_group_found(self, match_group: ImageMatch):
         """New match group found callback, update the GUI with new match group"""
@@ -821,11 +1015,15 @@ class MainWindow(QtWidgets.QMainWindow):
             if path.is_zip:
                 return
 
-            hash_ = self.processor._reverse_hashes.get(path)
-            if hash_ is None or self.processor._hashes[hash_].match_i is None:
+            if not self._has_duplicate(path):
                 return
 
         self.file_states[path] = state
+
+    def _has_duplicate(self, path: ZipPath) -> bool:
+        """Is this file in a match group?"""
+        hash_ = self.processor._reverse_hashes.get(path)
+        return hash_ is not None and self.processor._hashes[hash_].match_i is not None
 
     def mark_paths(self, paths: Iterable[ZipPath], state: SelectionValue):
         """
