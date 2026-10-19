@@ -5,6 +5,7 @@ import logging
 import shutil
 import time
 
+from enum import Enum
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Iterable
@@ -15,20 +16,26 @@ from send2trash import send2trash
 from pixmatch import Finished, ImageMatch, ImageMatcher, NewGroup, NewMatch, ZipPath, _is_under
 from pixmatch.gui.utils import MAX_SIZE_POLICY, NO_MARGIN
 from pixmatch.gui.widgets import (
-    STATE_ORDER,
     DirFileSystemModel,
     DuplicateGroupList,
     ImageViewPane,
     SelectionState,
     SelectionValue,
     SelectionValues,
-    _prompt_move_clear,
+    TileAction,
 )
 from pixmatch.utils import human_bytes
 
 ICON_PATH = Path(__file__).resolve().parent / 'pixmatch.ico'
 
 logger = logging.getLogger(__name__)
+
+
+class FileAction(Enum):
+    """What the Delete, Move and Save ignored actions do"""
+    DELETE = 'delete'
+    MOVE = 'move'
+    IGNORE = 'ignore'
 
 
 def ceildiv(a, b):
@@ -150,6 +157,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.recycle = True
 
+        # Remembers things between sessions, like the last folder files were moved to
+        self._settings = QtCore.QSettings("PixMatch", "PixMatch")
+
         # UI build
         self.build_menubar()
         self.build_central()
@@ -195,47 +205,31 @@ class MainWindow(QtWidgets.QMainWindow):
         # endregion
 
         # region Edit menu
-        # TODO: When adding this, make sure not to allow marking a zip file as delete
-        self.mark_delete_menu = QtGui.QAction("Delete", self)
-        self.mark_delete_group_menu = QtGui.QAction("Delete Group", self)
-        self.mark_delete_folder_menu = QtGui.QAction("Delete Folder", self)
+        self.mark_menu = QtGui.QAction("Mark", self)
         mark_ignore = QtGui.QAction("Ignore", self)
         mark_ignore_group = QtGui.QAction("Ignore Group", self)
         self.mark_ignore_zip_menu = QtGui.QAction("Ignore Zip", self)
-        self.mark_move_menu = QtGui.QAction("Move this file...", self)
-        mark_symlink = QtGui.QAction("Symlink this file...", self, enabled=False)
         unmark = QtGui.QAction("Un-select", self)
         unmark_group = QtGui.QAction("Un-select Group", self)
-        unmark_folder = QtGui.QAction("Un-select Folder", self)
         self.unmark_zip_menu = QtGui.QAction("Un-select Zip", self)
 
-        self.mark_delete_menu.triggered.connect(self.mark_delete)
-        self.mark_delete_group_menu.triggered.connect(self.mark_delete_group)
-        self.mark_delete_folder_menu.triggered.connect(self.mark_delete_folder)
-        self.mark_move_menu.triggered.connect(self.mark_move)
+        self.mark_menu.triggered.connect(self.mark_file)
         mark_ignore.triggered.connect(self.mark_ignore)
         mark_ignore_group.triggered.connect(self.mark_ignore_group)
         self.mark_ignore_zip_menu.triggered.connect(self.mark_ignore_zip)
         unmark.triggered.connect(self.mark_unmark)
         unmark_group.triggered.connect(self.mark_unmark_group)
-        unmark_folder.triggered.connect(self.mark_unmark_folder)
         self.unmark_zip_menu.triggered.connect(self.mark_unmark_zip)
 
         edit_menu = menu.addMenu("&Edit")
-        edit_menu.addAction(self.mark_delete_menu)
-        edit_menu.addAction(self.mark_delete_group_menu)
-        edit_menu.addAction(self.mark_delete_folder_menu)
+        edit_menu.addAction(self.mark_menu)
         edit_menu.addSeparator()
         edit_menu.addAction(mark_ignore)
         edit_menu.addAction(mark_ignore_group)
         edit_menu.addAction(self.mark_ignore_zip_menu)
         edit_menu.addSeparator()
-        edit_menu.addAction(self.mark_move_menu)
-        edit_menu.addAction(mark_symlink)
-        edit_menu.addSeparator()
         edit_menu.addAction(unmark)
         edit_menu.addAction(unmark_group)
-        edit_menu.addAction(unmark_folder)
         edit_menu.addAction(self.unmark_zip_menu)
         # endregion
 
@@ -274,8 +268,6 @@ class MainWindow(QtWidgets.QMainWindow):
         # endregion
 
         # region Actions menu
-        run_all = QtGui.QAction("Process All Actions", self)
-        run_all.triggered.connect(self.on_all_actions)
         run_move = QtGui.QAction("Move", self)
         run_move.triggered.connect(self.on_move)
         run_delete = QtGui.QAction("Delete", self)
@@ -284,7 +276,6 @@ class MainWindow(QtWidgets.QMainWindow):
         run_ignore.triggered.connect(self.on_ignore)
 
         actions_menu = menu.addMenu("&Actions")
-        actions_menu.addAction(run_all)
         actions_menu.addAction(run_move)
         actions_menu.addAction(run_delete)
         actions_menu.addAction(run_ignore)
@@ -328,8 +319,6 @@ class MainWindow(QtWidgets.QMainWindow):
         tool_box.setLayout(tools)
         tool_box.setMaximumHeight(60)
 
-        process_all_btn = QtWidgets.QPushButton("Process all")
-        process_all_btn.pressed.connect(self.on_all_actions)
         move_btn = QtWidgets.QPushButton("Move")
         move_btn.pressed.connect(self.on_move)
         delete_btn = QtWidgets.QPushButton("Delete")
@@ -338,14 +327,13 @@ class MainWindow(QtWidgets.QMainWindow):
         save_ignored_btn.pressed.connect(self.on_ignore)
 
         actions = QtWidgets.QVBoxLayout()
-        actions.addWidget(process_all_btn)
         actions.addWidget(move_btn)
         actions.addWidget(delete_btn)
         actions.addWidget(save_ignored_btn)
 
         actions_box = QtWidgets.QGroupBox("Actions")
         actions_box.setLayout(actions)
-        actions_box.setMaximumHeight(20 + 40 * 3)
+        actions_box.setMaximumHeight(20 + 40 * 2)
 
         general_controls_btns = QtWidgets.QVBoxLayout()
         general_controls_btns.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
@@ -529,17 +517,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.duplicate_group_list = DuplicateGroupList(sizePolicy=MAX_SIZE_POLICY)
         self.duplicate_group_list.groupTileStateChanged.connect(self.on_match_state_changed)
         self.duplicate_group_list.groupTileHovered.connect(self.on_tile_hover)
-        self.duplicate_group_list.groupTileMove.connect(self.mark_move)
-        self.duplicate_group_list.groupTileDeleteGroup.connect(self.mark_delete_group)
-        self.duplicate_group_list.groupTileDeleteColumn.connect(self.mark_delete_column)
-        self.duplicate_group_list.groupTileDeleteFolder.connect(self.mark_delete_folder)
-        self.duplicate_group_list.groupTileIgnoreGroup.connect(self.mark_ignore_group)
-        self.duplicate_group_list.groupTileIgnoreColumn.connect(self.mark_ignore_column)
-        self.duplicate_group_list.groupTileIgnoreZip.connect(self.mark_ignore_zip)
-        self.duplicate_group_list.groupTileUnmarkGroup.connect(self.mark_unmark_group)
-        self.duplicate_group_list.groupTileUnmarkColumn.connect(self.mark_unmark_column)
-        self.duplicate_group_list.groupTileUnmarkFolder.connect(self.mark_unmark_folder)
-        self.duplicate_group_list.groupTileUnmarkZip.connect(self.mark_unmark_zip)
+        self.duplicate_group_list.groupTileMenuAction.connect(self.on_tile_menu_action)
         self.duplicate_group_list.page_down.pressed.connect(self.on_page_down)
         self.duplicate_group_list.page_up.pressed.connect(self.on_page_up)
         self.duplicate_group_list.first_page.pressed.connect(self.on_page_first)
@@ -649,11 +627,11 @@ class MainWindow(QtWidgets.QMainWindow):
         """The regroup finished, so show the new groups"""
         self._end_regroup()
 
-        # A file is only marked for delete or move while it has a duplicate (see set_file_state).
+        # A file is only marked while it has a duplicate (see set_file_state).
         #   Some files lost theirs at this strength, so those markings no longer apply
         self.file_states = {
             path: state for path, state in self.file_states.items()
-            if state.state not in {SelectionState.DELETE, SelectionState.MOVE} or self._has_duplicate(path)
+            if state.state != SelectionState.MARK or self._has_duplicate(path)
         }
 
         self.current_page = 1
@@ -773,20 +751,16 @@ class MainWindow(QtWidgets.QMainWindow):
         return
 
     def on_delete(self, *_):
-        """Delete button pressed, process delete file states"""
-        self.process_file_states({SelectionState.DELETE})
+        """Delete button pressed, so delete every marked file"""
+        self.process_file_states(FileAction.DELETE)
 
     def on_ignore(self, *_):
-        """Ignore button pressed, process ignore file states"""
-        self.process_file_states({SelectionState.IGNORE})
+        """Save ignored button pressed, so take every ignored file out of the results"""
+        self.process_file_states(FileAction.IGNORE)
 
     def on_move(self, *_):
-        """Move button pressed, process move file states"""
-        self.process_file_states({SelectionState.MOVE})
-
-    def on_all_actions(self, *_):
-        """All actions button pressed, process all file states"""
-        self.process_file_states()
+        """Move button pressed, so ask for a folder and move every marked file there"""
+        self.process_file_states(FileAction.MOVE)
 
     @property
     def total_pages(self):
@@ -961,53 +935,58 @@ class MainWindow(QtWidgets.QMainWindow):
         """Unmark a file (mark as keep)"""
         self.change_file_state(target_path or self.image_view_area.current_path, SelectionValues.KEEP)
 
-    def mark_delete(self, target_path: ZipPath | None = None):
-        """Mark a file as delete"""
-        self.change_file_state(target_path or self.image_view_area.current_path, SelectionValues.DELETE)
+    def mark_file(self, target_path: ZipPath | None = None):
+        """Mark a file (for the Delete and Move actions)"""
+        self.change_file_state(target_path or self.image_view_area.current_path, SelectionValues.MARK)
 
     def mark_ignore(self, target_path: ZipPath | None = None):
         """Mark a file as ignore"""
         self.change_file_state(target_path or self.image_view_area.current_path, SelectionValues.IGNORE)
 
-    def mark_move(self, target_path: ZipPath | None = None):
-        """Prompt for a destination and mark a file to be moved."""
+    def choose_move_folder(self, title: str, near: Path) -> Path | None:
+        """
+        Ask which folder to move files to, starting in the last folder chosen (even in an earlier session).
 
-        path = target_path or self.image_view_area.current_path
+        Args:
+            title: The folder picker's title.
+            near: Where to start if no folder has been chosen before (or it's gone).
 
-        if not path or path.is_zip:
-            return
+        Returns:
+            Path | None: The folder, or None if none was chosen.
+        """
+        start = self._settings.value("move/last_folder", "", str)
+        if not start or not Path(start).is_dir():
+            start = str(near)
 
-        current_file = path.path_obj
-        if not current_file.exists():
-            return
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, title, start)
+        if not folder:
+            return None
 
-        destination, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self,
-            "Move file",
-            str(current_file),
+        self._settings.setValue("move/last_folder", folder)
+        return Path(folder)
+
+    def confirm(self, title: str, text: str) -> bool:
+        """
+        Ask a yes or no question, with no as the default.
+
+        Returns:
+            True if the user said yes.
+        """
+        answer = QtWidgets.QMessageBox.question(
+            self, title, text, defaultButton=QtWidgets.QMessageBox.StandardButton.No,
         )
-
-        if not destination:
-            return
-
-        destination_path = Path(destination)
-        if destination_path == current_file:
-            logger.info("Marking file as keep because it is the same file...")
-            self.change_file_state(path, SelectionValues.KEEP)
-            return
-
-        self.change_file_state(path, SelectionValue(SelectionState.MOVE, (destination_path, )))
+        return answer == QtWidgets.QMessageBox.StandardButton.Yes
 
     def set_file_state(self, path: ZipPath, state: SelectionValue):
         """
         Set the state of a single file. Every state change should go through here.
 
-        Files are only marked for delete or move while they are in a match group (i.e. they have a duplicate),
-            so bulk actions like "Delete folder" can't reach files that have no duplicate.
-        Files in zips are read-only, so they are never marked for delete or move:
-            processing them would act on the zip itself, not the file inside it.
+        Files are only marked (for the Delete and Move actions) while they are in a match group, i.e. they have a
+            duplicate, so bulk actions like "Ignore zip" can't mark files that have no duplicate.
+        Files in zips are read-only, so they are never marked:
+            deleting or moving them would act on the zip itself, not the file inside it.
         """
-        if state.state in {SelectionState.DELETE, SelectionState.MOVE}:
+        if state.state == SelectionState.MARK:
             if path.is_zip:
                 return
 
@@ -1051,35 +1030,9 @@ class MainWindow(QtWidgets.QMainWindow):
         """Mark all files in a group as ignore"""
         self.mark_group(target_path or self.image_view_area.current_path, SelectionValues.IGNORE)
 
-    def mark_delete_group(self, target_path: ZipPath | None = None):
-        """Mark all files in a group as delete"""
-        self.mark_group(target_path or self.image_view_area.current_path, SelectionValues.DELETE)
-
     def mark_unmark_group(self, target_path: ZipPath | None = None):
         """Mark all files in a group as keep"""
         self.mark_group(target_path or self.image_view_area.current_path, SelectionValues.KEEP)
-
-    def mark_column(self, column_i: int, selection: SelectionValues):
-        """Mark all tiles in a column as a particular state"""
-        self.mark_paths(
-            (row._tiles[column_i].path for row in self.duplicate_group_list._rows if column_i < len(row)),
-            selection,
-        )
-
-    # TODO: Make target_column option and get the column of the image view area.
-    #    This would allow me to add these options to the menu bar but honestly...
-    #    I'm fine with them just being in the context menu...
-    def mark_ignore_column(self, target_column: int):
-        """Mark all files in a column as ignore"""
-        self.mark_column(target_column, SelectionValues.IGNORE)
-
-    def mark_delete_column(self, target_column: int):
-        """Mark all files in a column as delete"""
-        self.mark_column(target_column, SelectionValues.DELETE)
-
-    def mark_unmark_column(self, target_column: int):
-        """Mark all files in a column as delete"""
-        self.mark_column(target_column, SelectionValues.KEEP)
 
     def mark_zip(self, target_path: ZipPath, state: SelectionValue):
         """Mark all files in a zip"""
@@ -1097,30 +1050,127 @@ class MainWindow(QtWidgets.QMainWindow):
         """Mark all files in a zip as ignore"""
         current_zip_path = target_path or self.image_view_area.current_path
         self.mark_zip(current_zip_path, SelectionValues.KEEP)
+    # endregion
 
-    def mark_folder(self, path: ZipPath, selection: SelectionValue):
-        """
-        Mark all files in a folder as a particular state.
+    # region Right click actions
+    def on_tile_menu_action(self, action: str, path: ZipPath):
+        """A tile's right click menu action that the tile can't do itself was chosen"""
+        handlers = {
+            TileAction.IGNORE_GROUP: self.mark_ignore_group,
+            TileAction.UNMARK_GROUP: self.mark_unmark_group,
+            TileAction.IGNORE_ZIP: self.mark_ignore_zip,
+            TileAction.UNMARK_ZIP: self.mark_unmark_zip,
+            TileAction.KEEP_DELETE_OTHERS: self.keep_this_delete_others,
+            TileAction.MOVE_LEAVE_OTHERS: lambda p: self.move_this(p, delete_others=False),
+            TileAction.MOVE_DELETE_OTHERS: lambda p: self.move_this(p, delete_others=True),
+        }
+        handlers[action](path)
 
-        Only duplicates can be marked for delete (see set_file_state),
-            so deleting a folder never deletes the files in it that have no duplicate.
+    def _group_others(self, path: ZipPath) -> list[ZipPath]:
+        """The other files in a file's group"""
+        hash_ = self.processor._reverse_hashes.get(path) if self.processor else None
+        if hash_ is None:
+            return []
+
+        return [p for p in self.processor._hashes[hash_].matches if p != path]
+
+    def _confirm_delete(self, paths: list[ZipPath], *, extra: str = "") -> bool:
         """
-        if not path:
+        Ask before deleting files right away.
+
+        Returns:
+            True if the user said yes.
+        """
+        where = "to the Recycle Bin" if self.recycle else "permanently"
+        names = "\n".join(f"    {p.path_obj.name}" for p in paths[:10])
+        if len(paths) > 10:
+            names += f"\n    ...and {len(paths) - 10} more"
+        return self.confirm("Delete?", f"{extra}Delete {len(paths)} file(s) {where}?\n\n{names}")
+
+    def keep_this_delete_others(self, path: ZipPath):
+        """Delete the rest of a file's group right away (except files in zips, which are read-only)"""
+        others = [p for p in self._group_others(path) if not p.is_zip]
+        if not others:
+            QtWidgets.QMessageBox.information(self, "Delete", "There are no other files in this group to delete.")
             return
 
-        path = path.path_obj
-        if not path.is_dir():
-            path = path.parent
+        if self._confirm_delete(others):
+            self.act_now(delete=others)
 
-        self.mark_paths((p for p in self.processor._reverse_hashes if p.path_obj.parent == path), selection)
+    def move_this(self, path: ZipPath, *, delete_others: bool):
+        """
+        Move a file to a folder right away, which takes it out of its group, and maybe delete the rest of the group.
 
-    def mark_delete_folder(self, target_path: ZipPath | None = None):
-        """Mark all files in a folder as delete"""
-        self.mark_folder(target_path or self.image_view_area.current_path, SelectionValues.DELETE)
+        The group stays if it still has two or more files, otherwise it goes away.
+        """
+        source = path.path_obj
+        if path.is_zip or not source.exists():
+            return
 
-    def mark_unmark_folder(self, target_path: ZipPath | None = None):
-        """Mark all files in a folder as keep"""
-        self.mark_folder(target_path or self.image_view_area.current_path, SelectionValues.KEEP)
+        folder = self.choose_move_folder(f"Move {source.name} to", source.parent)
+        if folder is None or folder == source.parent:
+            return
+
+        others = [p for p in self._group_others(path) if not p.is_zip] if delete_others else []
+        if others and not self._confirm_delete(others, extra=f"Move {source.name} to {folder}.\n"):
+            return
+
+        self.act_now(move=(path, folder), delete=others)
+
+    def act_now(self, *, move: tuple[ZipPath, Path] | None = None, delete: Iterable[ZipPath] = ()):
+        """
+        Move and delete files right away, then take them out of the results.
+
+        If the move fails, nothing is deleted. Files that fail to delete are left as they are, and listed.
+
+        Args:
+            move: A file and the folder to move it to.
+            delete: Files to delete (or send to the recycle bin).
+        """
+        if not self.processor:
+            return
+
+        is_paused = self.processor.conditional_pause()
+        self.image_view_area.clear()
+        failed = []
+        try:
+            if move:
+                path, folder = move
+                try:
+                    self.move_file(path.path_obj, folder)
+                except OSError as e:
+                    logger.warning("Failed to move %s to %s: %s", path, folder, e)
+                    QtWidgets.QMessageBox.warning(self, "Move", f"Couldn't move {path.path_obj}:\n{e}")
+                    return
+
+                self._forget(path)
+
+            for path in delete:
+                try:
+                    self.deleted_files_size += self.delete_file(path.path_obj)
+                    self.deleted_files_count += 1
+                except FileNotFoundError:
+                    logger.info("File already deleted: %s", path)
+                except OSError as e:
+                    logger.warning("Failed to delete %s: %s", path, e)
+                    failed.append(f"{path.path_obj.name}: {e}")
+                    continue
+
+                self._forget(path)
+        finally:
+            self.current_page = min(self.current_page, self.total_pages)
+            self.update_labels()
+            self.update_group_list()
+            self.processor.conditional_resume(is_paused)
+
+        if failed:
+            QtWidgets.QMessageBox.warning(self, "Delete", "Couldn't delete:\n" + "\n".join(failed))
+
+    def _forget(self, path: ZipPath):
+        """Take a file that was moved or deleted out of the results, along with any marking it had"""
+        self.file_states.pop(path, None)
+        if path in self.processor._reverse_hashes:
+            self.processor.remove(path)
     # endregion
 
     def update_group_list(self):
@@ -1138,20 +1188,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def change_file_state(self, path: ZipPath, state: SelectionValue):
         """A tile has been clicked and the match state was changed"""
-        current_file_state = self.file_states.get(path, SelectionValues.KEEP)
-        if current_file_state not in STATE_ORDER and not _prompt_move_clear(self, current_file_state.state):
-            return
-
         self.set_file_state(path, state)
         self.update_selection_states()
 
     def on_tile_hover(self, path: ZipPath):
         """A tile has been hovered over, so handle that logic"""
         self.image_view_area.set_image(path)
-        self.mark_delete_menu.setEnabled(not path.is_zip)
-        self.mark_delete_group_menu.setEnabled(not path.is_zip)
-        self.mark_delete_folder_menu.setEnabled(not path.is_zip)
-        self.mark_move_menu.setEnabled(not path.is_zip)
+        self.mark_menu.setEnabled(not path.is_zip)
         self.mark_ignore_zip_menu.setEnabled(path.is_zip)
 
     def on_match_state_changed(self, path: ZipPath, state):
@@ -1307,72 +1350,76 @@ class MainWindow(QtWidgets.QMainWindow):
 
         return file_size
 
-    def move_file(self, source: Path, destination: Path) -> Path:
+    @staticmethod
+    def move_file(source: Path, folder: Path) -> Path:
         """
-        Move a file, replacing any file already at the destination.
+        Move a file into a folder. It never replaces a file: if the name is taken, it gets " (2)", " (3)"... added.
 
         Returns:
             Path: Where the file was moved to.
         """
-        if destination.is_dir():
-            destination /= source.name
+        destination = folder / source.name
+        number = 2
+        while destination.exists():
+            destination = folder / f"{source.stem} ({number}){source.suffix}"
+            number += 1
 
-        if destination.is_file() and not destination.samefile(source):
-            # The user agreed to replace this when choosing the destination, but still respect the recycle bin option
-            self.delete_file(destination)
-
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        folder.mkdir(parents=True, exist_ok=True)
         logger.info("Moving %s to %s", source, destination)
         shutil.move(str(source), str(destination))
         return destination
 
-    def process_file_states(self, states: set[SelectionState] | None = None):
-        """Process the set file states"""
+    def process_file_states(self, action: "FileAction"):
+        """
+        Do an action to every file marked for it: Delete and Move act on MARK files, and Ignore on IGNORE ones.
+
+        Move asks for the folder first. Moved files never replace anything (see move_file).
+        """
         if not self.processor:
             return
 
+        wanted = SelectionState.IGNORE if action == FileAction.IGNORE else SelectionState.MARK
+        to_process = [path for path, state in self.file_states.items() if state.state == wanted]
+        if not to_process:
+            marked = "ignored" if wanted == SelectionState.IGNORE else "marked"
+            QtWidgets.QMessageBox.information(self, "Nothing to do", f"No files are {marked}.")
+            return
+
+        folder = None
+        if action == FileAction.MOVE:
+            folder = self.choose_move_folder(f"Move {len(to_process)} marked file(s) to", to_process[0].path_obj.parent)
+            if folder is None:
+                return
+
         is_paused = self.processor.conditional_pause()
         self.image_view_area.clear()
-
-        states = set(states or {SelectionState.DELETE, SelectionState.IGNORE, SelectionState.MOVE})
-        states.add(SelectionState.KEEP)
-        to_process = {k: v for k, v in self.file_states.items() if v.state in states}
 
         file_size_deleted = 0
         file_count_deleted = 0
         file_count_ignored = 0
         file_count_moved = 0
+        file_count_renamed = 0
         processed_files = set()
         failed_files = []
         skipped_files = []
 
         try:
-            for file, set_state in to_process.items():
-                if file in processed_files:
-                    continue
-
-                if set_state.state == SelectionState.KEEP:
-                    processed_files.add(file)
-                    continue
-
-                if file.is_zip and set_state.state in {SelectionState.DELETE, SelectionState.MOVE}:
+            for file in to_process:
+                if file.is_zip and action != FileAction.IGNORE:
                     # set_file_state never allows this, but acting on file.path_obj would delete or move the WHOLE zip
-                    logger.warning("Refusing to %s %s, files in zips are read-only", set_state.state.value, file)
+                    logger.warning("Refusing to %s %s, files in zips are read-only", action.value, file)
                     processed_files.add(file)
                     continue
 
-                if file not in self.processor._reverse_hashes and set_state.state != SelectionState.IGNORE:
+                if file not in self.processor._reverse_hashes and action != FileAction.IGNORE:
                     # Its folder was removed from the scan after it was marked, so leave the file alone
                     logger.info("Skipping %s, it is no longer part of the scan", file)
                     skipped_files.append(file)
                     processed_files.add(file)
                     continue
 
-                if set_state.state not in {SelectionState.DELETE, SelectionState.IGNORE, SelectionState.MOVE}:
-                    raise NotImplementedError(f"Unknown state {set_state.state.value}")
-
                 try:
-                    if set_state.state == SelectionState.DELETE:
+                    if action == FileAction.DELETE:
                         try:
                             file_size_deleted += self.delete_file(file.path_obj)
                             file_count_deleted += 1
@@ -1380,25 +1427,22 @@ class MainWindow(QtWidgets.QMainWindow):
                             logger.info("File already deleted: %s", file)
 
                         self.processor.remove(file)
-                    elif set_state.state == SelectionState.IGNORE:
+                    elif action == FileAction.IGNORE:
                         self.processor.ignore(file)
                         file_count_ignored += 1
-                    else:  # SelectionState.MOVE
-                        destination = self.move_file(file.path_obj, Path(set_state.args[0]))
-
-                        # If this replaced a file that was marked too, that marking doesn't apply to this file
-                        processed_files.add(ZipPath(str(destination)))
+                    else:  # FileAction.MOVE
+                        destination = self.move_file(file.path_obj, folder)
+                        file_count_renamed += destination.name != file.path_obj.name
 
                         if any(_is_under(f, destination) for f in self.file_paths_selected()):
                             self.processor.rename(file, ZipPath(str(destination)))
                         else:
                             # This file is no longer in a selected folder! So remove it from the matching
                             self.processor.remove(file)
-                            file_count_ignored += 1
                         file_count_moved += 1
                 except OSError as e:
                     # e.g. the file is open in another program. Leave it marked so it can be tried again
-                    logger.warning("Failed to %s %s: %s", set_state.state.value, file, e)
+                    logger.warning("Failed to %s %s: %s", action.value, file, e)
                     failed_files.append(file)
                 else:
                     processed_files.add(file)
@@ -1428,7 +1472,10 @@ class MainWindow(QtWidgets.QMainWindow):
             popup_text += f"Removed {file_count_ignored} files from matching.\n"
 
         if file_count_moved:
-            popup_text += f"Moved {file_count_moved} file.\n"
+            popup_text += f"Moved {file_count_moved} file(s) to {folder}.\n"
+
+        if file_count_renamed:
+            popup_text += f"Renamed {file_count_renamed} of them, since a file with the same name was already there.\n"
 
         if failed_files:
             popup_text += f"Failed to process {len(failed_files)} files (see the log), they are still marked.\n"

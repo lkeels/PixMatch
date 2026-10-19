@@ -35,10 +35,16 @@ Simply select some folders to parse and then click begin.
 
 Once duplicate groups begin to appear in the duplicates view,
     you can start to select actions for them and then execute those actions. 
-Clicking on a tile will cycle through actions, with red being delete, yellow being ignore, and green being no action.
+Clicking on a tile will cycle through marked, ignored, then neither, with a banner across the tile saying which.
+    The Delete and Move actions act on every MARKED file (Move asks which folder to move them to),
+    and Save ignored takes every IGNORED file out of the results.
+    Moving never replaces a file: if the name is taken, the moved file gets " (2)", " (3)"... added to its name.
+
+Right-clicking a tile can also act on its group right away: keep it and delete the others,
+    or move it to a folder and leave or delete the others.
 
 Images which are in zips and cannot be deleted will have a rar icon to denote such, 
-    and they cannot be marked for deletion.
+    and they cannot be marked.
 
 The status bar under each image shows the full path, the file size, the uncompressed file size, 
     the frames in the image if it is an animated image, the image dimensions and the last modified date.

@@ -1,4 +1,7 @@
 import io
+import math
+import subprocess as sp
+import sys
 
 from collections import OrderedDict, defaultdict
 from contextlib import ExitStack, nullcontext, suppress
@@ -7,7 +10,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from functools import cache, lru_cache
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 from zipfile import BadZipFile, ZipFile
 
 import numpy as np
@@ -23,33 +26,60 @@ ZIP_ICON_PATH = Path(__file__).resolve().parent / 'zip.png'
 
 
 class SelectionState(Enum):
-    """Per-thumbnail action state."""
+    """
+    Per-thumbnail action state.
+
+    The Delete and Move actions act on every MARK file, and Save ignored on every IGNORE one.
+    """
     KEEP = 'keep'
-    DELETE = 'delete'
+    MARK = 'mark'
     IGNORE = 'ignore'
-    MOVE = 'move'
 
 
 @dataclass(frozen=True)
 class SelectionValue:
-    """A selection state with any arguments"""
+    """A selection state"""
     state: SelectionState
-    args: tuple = ()
 
 
 class SelectionValues:
-    """Similar to the SelectionState enum, but for basic SelectionValue instances"""
+    """Similar to the SelectionState enum, but for SelectionValue instances"""
     KEEP = SelectionValue(SelectionState.KEEP)
-    DELETE = SelectionValue(SelectionState.DELETE)
+    MARK = SelectionValue(SelectionState.MARK)
     IGNORE = SelectionValue(SelectionState.IGNORE)
 
 
-STATE_ORDER = [SelectionValues.KEEP, SelectionValues.DELETE, SelectionValues.IGNORE]
-STATE_COLORS = {
-    SelectionState.KEEP: QtGui.QColor(80, 200, 120),     # green
-    SelectionState.DELETE: QtGui.QColor(230, 80, 80),    # red
-    SelectionState.IGNORE: QtGui.QColor(240, 190, 60),   # amber
-    SelectionState.MOVE: QtGui.QColor(130, 200, 255),    # blue
+class TileAction:
+    """The names of the tile context menu actions that the main window handles"""
+    IGNORE_GROUP = "ignore_group"
+    UNMARK_GROUP = "unmark_group"
+    IGNORE_ZIP = "ignore_zip"
+    UNMARK_ZIP = "unmark_zip"
+    KEEP_DELETE_OTHERS = "keep_delete_others"
+    MOVE_LEAVE_OTHERS = "move_leave_others"
+    MOVE_DELETE_OTHERS = "move_delete_others"
+
+
+STATE_ORDER = [SelectionValues.KEEP, SelectionValues.MARK, SelectionValues.IGNORE]
+
+
+@dataclass(frozen=True)
+class StateBannerStyle:
+    """How a tile shows a state: a tint over the thumbnail, and a labeled band across it"""
+    text: str
+    band: QtGui.QColor
+    text_color: QtGui.QColor
+    tint: QtGui.QColor
+
+
+# Keeping a file has no banner, so the thumbnail shows as is
+STATE_BANNERS = {
+    SelectionState.MARK: StateBannerStyle(
+        "MARKED", QtGui.QColor(170, 20, 20, 220), QtGui.QColor(255, 228, 228), QtGui.QColor(180, 30, 30, 80),
+    ),
+    SelectionState.IGNORE: StateBannerStyle(
+        "IGNORED", QtGui.QColor(55, 55, 55, 215), QtGui.QColor(225, 225, 225), QtGui.QColor(0, 0, 0, 110),
+    ),
 }
 
 
@@ -456,19 +486,6 @@ def get_overlay_icon(height, width):
     )
 
 
-def _prompt_move_clear(parent, state) -> bool:
-    """Ask the user to confirm clearing a complex state selection."""
-
-    response = QtWidgets.QMessageBox.question(
-        parent,
-        "Clear?",
-        f"Are you sure you want to clear the marking of {state.value}?",
-        QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
-        QtWidgets.QMessageBox.StandardButton.No,
-    )
-    return response == QtWidgets.QMessageBox.StandardButton.Yes
-
-
 class _ThumbnailJob(QtCore.QRunnable):
     """Loads thumbnails on a ThumbnailLoader's thread pool. A job's paths are all in the same zip, or it has one path"""
 
@@ -600,31 +617,74 @@ class ThumbnailLoader(QtCore.QObject):
         self.thumbnailLoaded.emit(path, thumb_size, pixmap)
 
 
+class StateBanner(QtWidgets.QWidget):
+    """
+    Shows a tile's state over its thumbnail: a tint, and a band running diagonally from the bottom left corner to
+        the top right one, with the state's name on it. Colored borders were too hard to see.
+
+    Clicks go through it to the tile underneath.
+    """
+
+    def __init__(self, parent: QtWidgets.QWidget):
+        super().__init__(parent)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, on=True)
+        self.setGeometry(parent.rect())
+        self._style: StateBannerStyle | None = None
+
+    def set_state(self, state: SelectionState):
+        """Show this state's banner, or none for a state that doesn't have one"""
+        style = STATE_BANNERS.get(state)
+        if style != self._style:
+            self._style = style
+            self.update()
+
+    def paintEvent(self, _event: QtGui.QPaintEvent):
+        """Paint the tint and the band"""
+        if self._style is None:
+            return
+
+        width, height = self.width(), self.height()
+        diagonal = (width * width + height * height) ** 0.5
+
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.TextAntialiasing)
+        painter.fillRect(self.rect(), self._style.tint)
+
+        # The biggest bold text that fits along most of the diagonal, and not taller than a fifth of the tile
+        font = QtGui.QFont(self.font())
+        font.setBold(True)
+        font.setPixelSize(max(6, int(min(width, height) / 5)))
+        while font.pixelSize() > 6 and QtGui.QFontMetrics(font).horizontalAdvance(self._style.text) > diagonal * 0.7:
+            font.setPixelSize(font.pixelSize() - 1)
+        metrics = QtGui.QFontMetrics(font)
+        band_height = metrics.height() + 4
+
+        # Turn the painter so its x axis runs up the diagonal, from the bottom left corner to the top right one,
+        #   then the band is just a rectangle along it (the widget clips off the parts past the corners)
+        painter.translate(width / 2, height / 2)
+        painter.rotate(-math.degrees(math.atan2(height, width)))
+        band = QtCore.QRectF(-diagonal / 2, -band_height / 2, diagonal, band_height)
+        painter.fillRect(band, self._style.band)
+        painter.setFont(font)
+        painter.setPen(self._style.text_color)
+        painter.drawText(band, QtCore.Qt.AlignmentFlag.AlignCenter, self._style.text)
+
+
 class ThumbnailTile(QtWidgets.QFrame):
     """
-    Clickable thumbnail tile that cycles between KEEP → DELETE → IGNORE.
+    Clickable thumbnail tile that cycles between KEEP → MARK → IGNORE.
 
     Attributes:
         path: Image path (opaque identifier for the caller).
         stateChanged(path: str, state: SelectionValue): Emitted on state updates.
         hovered(path: str): Emitted on cursor hovering over thumbnail tile.
     """
-    # TODO: Convert state outline to overlay icon
     stateChanged = QtCore.Signal(ZipPath, SelectionValue)
     hovered = QtCore.Signal(ZipPath)
 
-    # These need signals because they need to be handled by higher ups.
-    move = QtCore.Signal(ZipPath)
-    deleteGroup = QtCore.Signal(ZipPath)
-    deleteColumn = QtCore.Signal(ZipPath)
-    deleteFolder = QtCore.Signal(ZipPath)
-    ignoreGroup = QtCore.Signal(ZipPath)
-    ignoreColumn = QtCore.Signal(ZipPath)
-    ignoreZip = QtCore.Signal(ZipPath)
-    unmarkGroup = QtCore.Signal(ZipPath)
-    unmarkColumn = QtCore.Signal(ZipPath)
-    unmarkFolder = QtCore.Signal(ZipPath)
-    unmarkZip = QtCore.Signal(ZipPath)
+    # A context menu action that's handled by higher ups (one of the TileAction names), and the tile's path
+    menuAction = QtCore.Signal(str, ZipPath)
 
     def __init__(self, path: ZipPath, pixmap: QtGui.QPixmap | None = None, thumb_size: int = 32, parent=None):
         super().__init__(parent, frameShape=QtWidgets.QFrame.Shape.Box, lineWidth=2)
@@ -653,101 +713,79 @@ class ThumbnailTile(QtWidgets.QFrame):
             _overlay_icon.setFixedSize(thumb_size, thumb_size)  # small badge; adjust later if you want
             _overlay_icon.setPixmap(get_overlay_icon(thumb_size / 1.5, thumb_size / 1.5))
 
-        self.context_menu = QtWidgets.QMenu(self)
+        # Made after the zip icon, so it's drawn over it
+        self._banner = StateBanner(self._image)
 
-        act_delete = self.context_menu.addAction("Delete")
-        act_delete_group = self.context_menu.addAction("Delete group")
-        act_delete_column = self.context_menu.addAction("Delete column")
-        act_delete_folder = self.context_menu.addAction("Delete folder")
-        self.context_menu.addSeparator()
-        act_ignore = self.context_menu.addAction("Ignore")
-        act_ignore_group = self.context_menu.addAction("Ignore group")
-        act_ignore_column = self.context_menu.addAction("Ignore column")
-        act_ignore_zip = self.context_menu.addAction("Ignore zip")
-        self.context_menu.addSeparator()
-        act_move = self.context_menu.addAction("Move this file")
-        act_symlink = self.context_menu.addAction("Symlink this file")
-        self.context_menu.addSeparator()
-        act_unmark = self.context_menu.addAction("Un-select")
-        act_unmark_group = self.context_menu.addAction("Un-select group")
-        act_unmark_column = self.context_menu.addAction("Un-select column")
-        act_unmark_folder = self.context_menu.addAction("Un-select folder")
-        act_unmark_zip = self.context_menu.addAction("Un-select zip")
+        self.context_menu = self._build_context_menu()
 
-        # Enablement: only these three should work right now
-        # If the path is from a zip (locked), disable Delete here as well.
-        act_delete.setEnabled(not self._path.is_zip)
-        act_delete_group.setEnabled(not self._path.is_zip)
-        act_delete_column.setEnabled(not self._path.is_zip)
-        act_delete_folder.setEnabled(not self._path.is_zip)
-        act_move.setEnabled(not self._path.is_zip)
-        act_ignore_zip.setEnabled(self._path.is_zip)
-        act_unmark_zip.setEnabled(self._path.is_zip)
-
-        act_move.triggered.connect(self.on_move)
-        act_delete_group.triggered.connect(self.on_delete_group)
-        act_delete_column.triggered.connect(self.on_delete_column)
-        act_delete_folder.triggered.connect(self.on_delete_folder)
-        act_ignore_group.triggered.connect(self.on_ignore_group)
-        act_ignore_column.triggered.connect(self.on_ignore_column)
-        act_ignore_zip.triggered.connect(self.on_ignore_zip)
-        act_unmark_group.triggered.connect(self.on_unmark_group)
-        act_unmark_column.triggered.connect(self.on_unmark_column)
-        act_unmark_folder.triggered.connect(self.on_unmark_folder)
-        act_unmark_zip.triggered.connect(self.on_unmark_zip)
-
-        act_symlink.setEnabled(False)  # TODO:
-
-        # Wire up state changes
-        act_delete.triggered.connect(lambda _=False: self.change_state_clicked(SelectionValues.DELETE))
-        act_ignore.triggered.connect(lambda _=False: self.change_state_clicked(SelectionValues.IGNORE))
-        act_unmark.triggered.connect(lambda _=False: self.change_state_clicked(SelectionValues.KEEP))
-
+        self.setStyleSheet(
+            """
+            QFrame#ThumbnailTile {
+                border: 2px solid rgba(90, 90, 90, 220);
+                border-radius: 6px;
+                background: #202020;
+            }
+            """,
+        )
         self._apply_state_style()
 
-    def on_delete_group(self):
-        """Delete group button pressed, so emit"""
-        self.deleteGroup.emit(self._path)
+    def _build_context_menu(self) -> QtWidgets.QMenu:
+        """
+        Build the right click menu.
 
-    def on_delete_column(self):
-        """Delete column button pressed, so emit"""
-        self.deleteColumn.emit(self._path)
+        The first sections mark files, which nothing happens to until an action (Delete, Move, Save ignored) is
+            pressed. The "this, others" section moves or deletes files right away.
 
-    def on_delete_folder(self):
-        """Delete folder button pressed, so emit"""
-        self.deleteFolder.emit(self._path)
+        Returns:
+            QtWidgets.QMenu: The menu.
+        """
+        menu = QtWidgets.QMenu(self)
+        in_zip = self._path.is_zip  # Files in zips are read-only, so they can't be deleted or moved
 
-    def on_ignore_group(self):
-        """Ignore group button pressed, so emit"""
-        self.ignoreGroup.emit(self._path)
+        def add(text: str, handler, *, enabled: bool = True):
+            action = menu.addAction(text)
+            action.setEnabled(enabled)
+            action.triggered.connect(lambda _=False: handler())
 
-    def on_ignore_column(self):
-        """Ignore column button pressed, so emit"""
-        self.ignoreColumn.emit(self._path)
+        def emit(action: str) -> Callable[[], None]:
+            return lambda: self.menuAction.emit(action, self._path)
 
-    def on_ignore_zip(self):
-        """Ignore zip button pressed, so emit"""
-        self.ignoreZip.emit(self._path)
+        add("Mark", lambda: self.change_state_clicked(SelectionValues.MARK), enabled=not in_zip)
+        add("Ignore", lambda: self.change_state_clicked(SelectionValues.IGNORE))
+        add("Un-select", lambda: self.change_state_clicked(SelectionValues.KEEP))
+        menu.addSeparator()
+        add("Ignore group", emit(TileAction.IGNORE_GROUP))
+        add("Un-select group", emit(TileAction.UNMARK_GROUP))
+        menu.addSeparator()
+        add("Keep this, delete others", emit(TileAction.KEEP_DELETE_OTHERS))
+        add("Move this, leave others...", emit(TileAction.MOVE_LEAVE_OTHERS), enabled=not in_zip)
+        add("Move this, delete others...", emit(TileAction.MOVE_DELETE_OTHERS), enabled=not in_zip)
+        if in_zip:
+            menu.addSeparator()
+            add("Ignore zip", emit(TileAction.IGNORE_ZIP))
+            add("Un-select zip", emit(TileAction.UNMARK_ZIP))
+        menu.addSeparator()
+        add("Open image", self.open_image, enabled=not in_zip)
+        add("Open containing folder", self.open_folder)
+        add("Copy path", self.copy_path)
+        return menu
 
-    def on_unmark_group(self):
-        """Unmark group button pressed, so emit"""
-        self.unmarkGroup.emit(self._path)
+    def open_image(self):
+        """Open the image in the default program for it"""
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(self._path.path))
 
-    def on_unmark_column(self):
-        """Unmark column button pressed, so emit"""
-        self.unmarkColumn.emit(self._path)
+    def open_folder(self):
+        """Open the folder the image (or its zip) is in, with it selected if possible"""
+        path = Path(self._path.path)
+        if sys.platform == "win32":
+            sp.Popen(f'explorer /select,"{path}"')
+        else:
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path.parent)))
 
-    def on_unmark_folder(self):
-        """Unmark folder button pressed, so emit"""
-        self.unmarkFolder.emit(self._path)
-
-    def on_unmark_zip(self):
-        """Unmark zip button pressed, so emit"""
-        self.unmarkZip.emit(self._path)
-
-    def on_move(self):
-        """Move button pressed, so emit"""
-        self.move.emit(self._path)
+    def copy_path(self):
+        """Copy the image's path, which for an image in a zip is the zip's path followed by its path in the zip"""
+        text = str(Path(self._path.path, self._path.subpath)) if self._path.is_zip else self._path.path
+        QtWidgets.QApplication.clipboard().setText(text)
 
     def set_pixmap(self, pixmap: QtGui.QPixmap):
         """Show the thumbnail image (a tile can be made before its thumbnail has loaded)"""
@@ -775,7 +813,7 @@ class ThumbnailTile(QtWidgets.QFrame):
             return
 
         locked = bool(self._path.subpath)
-        if locked and state.state in [SelectionState.DELETE, SelectionState.MOVE]:
+        if locked and state.state == SelectionState.MARK:
             raise ValueError(f"Cannot set a locked file to the {state.state.value} state!")
 
         self._state = state
@@ -783,25 +821,15 @@ class ThumbnailTile(QtWidgets.QFrame):
 
     def change_state_clicked(self, state: SelectionValue):
         """A change state button has been clicked in the context menu"""
-        if self._state not in STATE_ORDER:
-            if _prompt_move_clear(self, self._state.state):
-                self.state = SelectionValues.KEEP
-            return
-
         self.state = state
 
     def cycle_state(self):
-        """Advance KEEP → DELETE → IGNORE → KEEP."""
-        if self._state not in STATE_ORDER:
-            if _prompt_move_clear(self, self._state.state):
-                self.state = SelectionValues.KEEP
-            return
-
+        """Advance KEEP → MARK → IGNORE → KEEP."""
         idx = STATE_ORDER.index(self._state)
         locked = bool(self._path.subpath)
         next_state = STATE_ORDER[(idx + 1) % len(STATE_ORDER)]
-        # Cannot set zips to delete:
-        if locked and next_state == SelectionValues.DELETE:
+        # Files in zips can't be marked, since they can't be deleted or moved:
+        if locked and next_state == SelectionValues.MARK:
             next_state = STATE_ORDER[(idx + 2) % len(STATE_ORDER)]
         self.state = next_state
 
@@ -819,23 +847,8 @@ class ThumbnailTile(QtWidgets.QFrame):
         super().enterEvent(e)
 
     def _apply_state_style(self):
-        """Update frame color"""
-        color = STATE_COLORS[self._state.state]
-        self.setStyleSheet(
-            f"""
-            QFrame#ThumbnailTile {{
-                border: 2px solid rgba({color.red()}, {color.green()}, {color.blue()}, 220);
-                border-radius: 6px;
-                background: #202020;
-            }}
-            QLabel#StateBadge {{
-                color: black;
-                background: rgba({color.red()}, {color.green()}, {color.blue()}, 220);
-                border-radius: 6px;
-                font-weight: 600;
-            }}
-            """,
-        )
+        """Show the state's banner over the thumbnail"""
+        self._banner.set_state(self._state.state)
 
     def contextMenuEvent(self, event: QtGui.QContextMenuEvent):
         """Handle opening the context menu"""
@@ -853,18 +866,7 @@ class DuplicateGroupRow(QtWidgets.QWidget):
     """
     tileStateChanged = QtCore.Signal(ZipPath, SelectionValue)
     tileHovered = QtCore.Signal(ZipPath)
-
-    tileMove = QtCore.Signal(ZipPath)
-    tileDeleteGroup = QtCore.Signal(ZipPath)
-    tileDeleteColumn = QtCore.Signal(int)
-    tileDeleteFolder = QtCore.Signal(ZipPath)
-    tileIgnoreGroup = QtCore.Signal(ZipPath)
-    tileIgnoreColumn = QtCore.Signal(int)
-    tileIgnoreZip = QtCore.Signal(ZipPath)
-    tileUnmarkGroup = QtCore.Signal(ZipPath)
-    tileUnmarkColumn = QtCore.Signal(int)
-    tileUnmarkFolder = QtCore.Signal(ZipPath)
-    tileUnmarkZip = QtCore.Signal(ZipPath)
+    tileMenuAction = QtCore.Signal(str, ZipPath)
 
     def __init__(self, images: Sequence[ZipPath], thumb_size: int = 32, parent=None, *, thumbnails: ThumbnailLoader):
         super().__init__(parent)
@@ -896,17 +898,7 @@ class DuplicateGroupRow(QtWidgets.QWidget):
         tile = ThumbnailTile(path=path, pixmap=pixmap, thumb_size=self._thumb_size)
         tile.stateChanged.connect(self.tileStateChanged)
         tile.hovered.connect(self.tileHovered)
-        tile.move.connect(self.tileMove)
-        tile.deleteGroup.connect(self.tileDeleteGroup)
-        tile.deleteColumn.connect(self.on_mark_delete_column)
-        tile.deleteFolder.connect(self.tileDeleteFolder)
-        tile.ignoreGroup.connect(self.tileIgnoreGroup)
-        tile.ignoreColumn.connect(self.on_mark_ignore_column)
-        tile.ignoreZip.connect(self.tileIgnoreZip)
-        tile.unmarkGroup.connect(self.tileUnmarkGroup)
-        tile.unmarkColumn.connect(self.on_unmark_column)
-        tile.unmarkFolder.connect(self.tileUnmarkFolder)
-        tile.unmarkZip.connect(self.tileUnmarkZip)
+        tile.menuAction.connect(self.tileMenuAction)
         self._tiles.append(tile)
         self.layout.insertWidget(len(self._tiles) - 1, tile)
 
@@ -918,33 +910,6 @@ class DuplicateGroupRow(QtWidgets.QWidget):
         for tile in self._tiles:
             if tile.path == path:
                 tile.set_pixmap(pixmap)
-
-    def on_mark_delete_column(self, target_path: ZipPath):
-        """Mark delete column has been clicked, convert from a path to an integer"""
-        for tile_i, tile in enumerate(self._tiles):
-            if tile.path == target_path:
-                self.tileDeleteColumn.emit(tile_i)
-                return
-
-        raise ValueError("This should never happen!")
-
-    def on_mark_ignore_column(self, target_path: ZipPath):
-        """Mark ignore column has been clicked, convert from a path to an integer"""
-        for tile_i, tile in enumerate(self._tiles):
-            if tile.path == target_path:
-                self.tileIgnoreColumn.emit(tile_i)
-                return
-
-        raise ValueError("This should never happen!")
-
-    def on_unmark_column(self, target_path: ZipPath):
-        """Unmark column has been clicked, convert from a path to an integer"""
-        for tile_i, tile in enumerate(self._tiles):
-            if tile.path == target_path:
-                self.tileUnmarkColumn.emit(tile_i)
-                return
-
-        raise ValueError("This should never happen!")
 
 
 class ClickableLabel(QtWidgets.QLabel):
@@ -965,25 +930,15 @@ class DuplicateGroupList(QtWidgets.QWidget):
     Scrollable list of duplicate groups. Each group renders as a row of thumbnails.
 
     Notes:
-        - Clicking a thumbnail cycles KEEP → DELETE → IGNORE.
-        - Borders/badges are colored by state.
+        - Clicking a thumbnail cycles KEEP → MARK → IGNORE.
+        - Marked tiles have a banner across them saying how (see StateBanner).
     """
 
     groupTileStateChanged = QtCore.Signal(ZipPath, SelectionValue)  # path, state
     groupTileHovered = QtCore.Signal(ZipPath)
     pageIndicatorClicked = QtCore.Signal()
 
-    groupTileMove = QtCore.Signal(ZipPath)
-    groupTileDeleteGroup = QtCore.Signal(ZipPath)
-    groupTileDeleteColumn = QtCore.Signal(int)
-    groupTileDeleteFolder = QtCore.Signal(ZipPath)
-    groupTileIgnoreGroup = QtCore.Signal(ZipPath)
-    groupTileIgnoreColumn = QtCore.Signal(int)
-    groupTileIgnoreZip = QtCore.Signal(ZipPath)
-    groupTileUnmarkGroup = QtCore.Signal(ZipPath)
-    groupTileUnmarkColumn = QtCore.Signal(int)
-    groupTileUnmarkFolder = QtCore.Signal(ZipPath)
-    groupTileUnmarkZip = QtCore.Signal(ZipPath)
+    groupTileMenuAction = QtCore.Signal(str, ZipPath)
 
     def __init__(self, parent=None, *, max_rows: int = 25, thumb_size: int = 64, **kwargs):
         super().__init__(parent, **kwargs)
@@ -1060,17 +1015,7 @@ class DuplicateGroupList(QtWidgets.QWidget):
         row = DuplicateGroupRow(group, thumb_size=self._thumb_size, thumbnails=self._thumbnails)
         row.tileStateChanged.connect(self.groupTileStateChanged)
         row.tileHovered.connect(self.groupTileHovered)
-        row.tileMove.connect(self.groupTileMove)
-        row.tileDeleteGroup.connect(self.groupTileDeleteGroup)
-        row.tileDeleteColumn.connect(self.groupTileDeleteColumn)
-        row.tileDeleteFolder.connect(self.groupTileDeleteFolder)
-        row.tileIgnoreGroup.connect(self.groupTileIgnoreGroup)
-        row.tileIgnoreColumn.connect(self.groupTileIgnoreColumn)
-        row.tileIgnoreZip.connect(self.groupTileIgnoreZip)
-        row.tileUnmarkGroup.connect(self.groupTileUnmarkGroup)
-        row.tileUnmarkColumn.connect(self.groupTileUnmarkColumn)
-        row.tileUnmarkFolder.connect(self.groupTileUnmarkFolder)
-        row.tileUnmarkZip.connect(self.groupTileUnmarkZip)
+        row.tileMenuAction.connect(self.groupTileMenuAction)
         tail_index = self._vbox.count() - 1
         self._vbox.insertWidget(tail_index, row)
         self._rows.append(row)
