@@ -404,17 +404,28 @@ class MainWindow(QtWidgets.QMainWindow):
 
         labels = QtWidgets.QVBoxLayout()
         labels.setContentsMargins(NO_MARGIN)
-        self._remaining_files_label = QtWidgets.QLabel()
+
+        # The counts: names on the left, and their numbers lined up on the right
+        stats = QtWidgets.QGridLayout()
+        stats.setContentsMargins(NO_MARGIN)
+        stats.setHorizontalSpacing(6)
+        stats.setVerticalSpacing(0)
+        stats.setColumnStretch(1, 1)
+        value_labels = []
+        for row, name in enumerate(("Remaining files", "Loaded pictures", "Duplicate pictures", "Duplicate groups",
+                                    "Deleted files", "Deleted size")):
+            stats.addWidget(QtWidgets.QLabel(name), row, 0)
+            value = QtWidgets.QLabel()
+            value.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+            stats.addWidget(value, row, 1)
+            value_labels.append(value)
+        (self._remaining_files_label, self._loaded_pictures_label, self._dup_pictures_label, self._dup_groups_label,
+         self._deleted_files_count_label, self._deleted_files_size_label) = value_labels
         self.set_remaining_files_label(0)
-        self._loaded_pictures_label = QtWidgets.QLabel()
         self.set_loaded_pictures_label(0)
-        self._dup_pictures_label = QtWidgets.QLabel()
         self.set_duplicate_images_label(0)
-        self._dup_groups_label = QtWidgets.QLabel()
         self.set_duplicate_groups_label(0)
-        self._deleted_files_count_label = QtWidgets.QLabel()
         self.set_deleted_files_label(0)
-        self._deleted_files_size_label = QtWidgets.QLabel()
         self.set_deleted_size_label(0)
 
         self._timer_label = QtWidgets.QLabel("00:00:00", alignment=QtCore.Qt.AlignmentFlag.AlignHCenter)
@@ -428,12 +439,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._label_timer.timeout.connect(self._on_labels_tick)
 
         self._progress_bar = QtWidgets.QProgressBar(value=50, textVisible=False)
-        labels.addWidget(self._remaining_files_label)
-        labels.addWidget(self._loaded_pictures_label)
-        labels.addWidget(self._dup_pictures_label)
-        labels.addWidget(self._dup_groups_label)
-        labels.addWidget(self._deleted_files_count_label)
-        labels.addWidget(self._deleted_files_size_label)
+        labels.addLayout(stats)
         labels.addWidget(self._timer_label)
         labels.addWidget(self._progress_bar)
         labels.addLayout(run_controls)
@@ -524,7 +530,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         labels_and_such = QtWidgets.QHBoxLayout()
         labels_and_such.setContentsMargins(NO_MARGIN)
-        labels_and_such.addWidget(QtWidgets.QWidget(layout=labels, maximumWidth=140))
+        stats_width = self.fontMetrics().horizontalAdvance("Duplicate pictures") + 6 + \
+            self.fontMetrics().horizontalAdvance("9,999,999") + 4
+        labels_and_such.addWidget(QtWidgets.QWidget(layout=labels, maximumWidth=max(140, stats_width)))
         labels_and_such.addWidget(such)
 
         primary_controls = QtWidgets.QVBoxLayout()
@@ -903,27 +911,27 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def set_duplicate_groups_label(self, duplicate_groups: int):
         """Set the duplicate groups count label"""
-        self._dup_groups_label.setText(f"Duplicate groups....{duplicate_groups}")
+        self._dup_groups_label.setText(f"{duplicate_groups:,}")
 
     def set_duplicate_images_label(self, duplicate_images: int):
         """Set the duplicate images count label"""
-        self._dup_pictures_label.setText(f"Duplicate pictures..{duplicate_images}")
+        self._dup_pictures_label.setText(f"{duplicate_images:,}")
 
     def set_remaining_files_label(self, remaining_files: int):
         """Set the remaining files count label"""
-        self._remaining_files_label.setText(f"Remaining files....{remaining_files}")
+        self._remaining_files_label.setText(f"{remaining_files:,}")
 
     def set_loaded_pictures_label(self, loaded_pictures: int):
         """Set the loaded pictures count label"""
-        self._loaded_pictures_label.setText(f"Loaded pictures..{loaded_pictures}")
+        self._loaded_pictures_label.setText(f"{loaded_pictures:,}")
 
     def set_deleted_files_label(self, deleted_files: int):
         """Set the deleted files count label"""
-        self._deleted_files_count_label.setText(f"Deleted files...{deleted_files}")
+        self._deleted_files_count_label.setText(f"{deleted_files:,}")
 
     def set_deleted_size_label(self, deleted_size: int):
         """Set the deleted file size label"""
-        self._deleted_files_size_label.setText(f"Deleted size..{human_bytes(deleted_size)}")
+        self._deleted_files_size_label.setText(human_bytes(deleted_size))
 
     def update_labels(self):
         """Update all of the boring labels that need to be regularly updated, and the progress bar"""
