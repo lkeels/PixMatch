@@ -11,7 +11,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Iterable
 
-from PIL import ImageFile
+from PIL import Image, ImageFile
 from PySide6 import QtCore, QtGui, QtWidgets
 from send2trash import send2trash
 
@@ -28,9 +28,14 @@ from pixmatch.gui.widgets import (
 )
 from pixmatch.utils import human_bytes
 
-# Allow damaged images. This Pillow setting applies to the whole process, so the app sets it rather than pixmatch
-#   setting it for anything that imports it. ImageMatcher passes it on to the processes that hash images.
+# Allow damaged images, and very large ones. These Pillow settings apply to the whole process, so the app sets them
+#   rather than pixmatch setting them for anything that imports it. ImageMatcher passes them on to the processes that
+#   hash images.
+#   Pillow warns about images over ~89 megapixels as a possible "decompression bomb" (a small file made to fill memory
+#   when it's opened), and refuses ones over twice that. The images here are the user's own, so that's no reason to
+#   leave a large photo or scan out.
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+Image.MAX_IMAGE_PIXELS = None
 
 ICON_PATH = Path(__file__).resolve().parent / 'pixmatch.ico'
 

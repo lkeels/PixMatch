@@ -210,14 +210,15 @@ def _one_blas_thread():
             os.environ[BLAS_THREADS_VAR] = before
 
 
-def _init_worker(load_truncated_images: bool):  # ruff: ignore[boolean-type-hint-positional-argument]
+def _init_worker(load_truncated_images: bool, max_image_pixels: int | None):  # ruff: ignore[boolean-type-hint-positional-argument]
     """
     Set up a process of the pool that hashes images.
 
     Pillow's settings belong to each process, and the pool's processes don't get the settings of the one that made them
-        (on Windows they start from scratch). So a setting like allowing damaged images is passed on here.
+        (on Windows they start from scratch). So settings like allowing damaged or very large images are passed on here.
     """
     ImageFile.LOAD_TRUNCATED_IMAGES = load_truncated_images
+    Image.MAX_IMAGE_PIXELS = max_image_pixels
 
 
 def thread_error_handler(func):
@@ -436,8 +437,9 @@ class ImageMatcher:
     """
     An image matching SDK
 
-    Images are hashed in other processes, which use this process's setting for PIL.ImageFile.LOAD_TRUNCATED_IMAGES.
-        So set that to True to hash damaged images too (the app does), rather than skipping them.
+    Images are hashed in other processes, which use this process's settings for PIL.ImageFile.LOAD_TRUNCATED_IMAGES
+        and PIL.Image.MAX_IMAGE_PIXELS. So set those to True and None to hash damaged and very large images too (the app
+        does), rather than skipping them.
 
     While `run` is running, images are added on another thread. To change the matcher's data or read through it
         (like `matches`) from any other thread meanwhile, do it in a `with matcher.paused():` block.
@@ -1144,7 +1146,7 @@ class ImageMatcher:
         unsent = deque()  # The files found that are waiting to be handed to the pool, see _send_files
         with _one_blas_thread():  # The pool starts its processes as it's made
             pool = Pool(processes,
-                        initializer=_init_worker, initargs=(ImageFile.LOAD_TRUNCATED_IMAGES, ))
+                        initializer=_init_worker, initargs=(ImageFile.LOAD_TRUNCATED_IMAGES, Image.MAX_IMAGE_PIXELS))
         with pool as tp:
             # Waiting for results is when the files that were waiting for room in the pool are handed over
             for path in self._root_stream(partial(self._send_files, tp, unsent, wait=0.05)):
