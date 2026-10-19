@@ -28,20 +28,14 @@ if __name__ == "__main__":
 
     if platform.system() == "Windows":
         # Need to tell Windows to not use the Python app icon and use the Window icon isntead...
-        #    I'm not sure on the specifics but calling this method with any string seems to do the trick....
+        #    The taskbar groups windows by this ID, so with our own ID the app gets its own button instead of Python's.
+        #    Microsoft's format is CompanyName.ProductName, with no version so that upgrades keep any taskbar pins.
         # https://stackoverflow.com/questions/1551605
+        # https://learn.microsoft.com/en-us/windows/win32/shell/appids
         import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('company.app.1')
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('RHeard.PixMatch')
 
     app = QtWidgets.QApplication([])
-    # Basic stylesheet for subtle polish without complexity.
-    app.setStyleSheet(
-        """
-        QToolBar { spacing: 8px; }
-        QLabel#GroupTitle { padding: 4px 0; }
-        QFrame#ImageTile { border: 1px solid #444; border-radius: 6px; padding: 6px; }
-        """,
-    )
     w = MainWindow(args.folders)
     w.show()
     app.exec()

@@ -1,14 +1,20 @@
 import io
 import math
+import os
+import queue
+import stat
 import subprocess as sp
 import sys
+import threading
+import time
 
 from collections import OrderedDict, defaultdict
 from contextlib import ExitStack, nullcontext, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from functools import cache, lru_cache
+from functools import cache
+from itertools import count
 from pathlib import Path
 from typing import Callable, Sequence
 from zipfile import BadZipFile, ZipFile
@@ -23,6 +29,9 @@ from pixmatch.gui.utils import MAX_SIZE_POLICY, NO_MARGIN
 from pixmatch.utils import human_bytes
 
 ZIP_ICON_PATH = Path(__file__).resolve().parent / 'zip.png'
+
+PREVIEW_CACHE_BYTES = 512 * 1024 * 1024  # The most memory the previews kept for showing again can take up
+PREFETCH_LIMIT = 8  # The most images of a hovered tile's group whose previews are read ahead of being hovered
 
 
 class SelectionState(Enum):
@@ -130,6 +139,35 @@ def _decode_thumbnail(data: bytes, thumb_size: int) -> QtGui.QImage:
     return QtGui.QImage(thumbnail.tobytes(), thumb_size, thumb_size, QtGui.QImage.Format.Format_RGBA8888).copy()
 
 
+def _decode_image(data: bytes) -> QtGui.QImage:
+    """
+    Decode an image's data (a file in a zip) for the preview, with Pillow, off the GUI thread.
+
+    Qt could only read this data through a QBuffer made in Python, which deadlocks off the GUI thread (see
+        _decode_thumbnail), or with QImage.fromData, which holds the GIL until it's done, stalling the GUI meanwhile.
+
+    Returns:
+        QtGui.QImage: The image, which is null if it couldn't be read (like QImageReader's).
+    """
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            if im.mode.startswith("I;16"):
+                # Pillow clips 16-bit values to 0-255 when converting, which turns nearly everything white
+                im = Image.fromarray((np.asarray(im) >> 8).astype(np.uint8))
+            # In Qt's own 32-bit formats, so making a QPixmap from it doesn't convert every pixel again
+            if im.mode in {"RGBA", "RGBa", "LA", "La", "PA"} or "transparency" in im.info:
+                im, raw_mode, image_format = im.convert("RGBA"), "BGRA", QtGui.QImage.Format.Format_ARGB32
+            else:
+                im, raw_mode, image_format = im.convert("RGB"), "BGRX", QtGui.QImage.Format.Format_RGB32
+            width, height = im.size
+            pixels = im.tobytes("raw", raw_mode)
+    except (OSError, SyntaxError, ValueError, Image.DecompressionBombError):
+        return QtGui.QImage()
+
+    # Copied so the QImage has its own pixels, instead of pointing at the bytes (which are about to be freed)
+    return QtGui.QImage(pixels, width, height, image_format).copy()
+
+
 def movie_sizes(movie: QtGui.QMovie):
     """Get the dimensions of a QMovie, and uncompressed file size"""
     # Every frame is drawn onto the same canvas, so the first frame has the size of them all. Measuring each frame
@@ -137,6 +175,219 @@ def movie_sizes(movie: QtGui.QMovie):
     movie.jumpToFrame(0)
     first_frame = movie.currentImage()
     return first_frame.size(), first_frame.sizeInBytes() * max(movie.frameCount(), 1)
+
+
+def close_movie(movie: QtGui.QMovie):
+    """Stop a movie that's no longer shown, and delete it (with the buffer it plays from) once Qt is done with it"""
+    movie.device().close()
+    movie.stop()
+    movie.deleteLater()
+
+
+@dataclass
+class _Preview:
+    """
+    An image read for the preview, with the details about its file that are shown under it.
+
+    An animation keeps its file's data, and plays from that in memory. Playing it from its file kept the file open (and
+        Windows won't delete or move an open file), and read the file again whenever it was shown.
+    """
+    path: str  # The path to show
+    file_size: int | None = None
+    modified: str | None = None  # As it's shown
+    image: QtGui.QImage | None = None  # A still image as it was read. Only the GUI thread can make it a QPixmap
+    pixmap: QtGui.QPixmap | None = None  # A still image ready to show, see ready
+    movie_data: QtCore.QByteArray | None = None  # An animation's file
+    error: str = ''  # Why it couldn't be read
+
+    @property
+    def cost(self) -> int:
+        """About how much memory this takes up"""
+        if self.pixmap is not None:
+            return self.pixmap.width() * self.pixmap.height() * self.pixmap.depth() // 8
+        if self.movie_data is not None:
+            return self.movie_data.size()
+        return 0
+
+    def ready(self):
+        """Make a still image into a QPixmap to show. This must be done on the GUI thread"""
+        if self.image is not None:
+            self.pixmap = QtGui.QPixmap.fromImage(self.image)
+            self.image = None
+
+
+def _read_preview(path: ZipPath) -> _Preview:
+    """
+    Read an image for the preview, still or animated, with the details about its file.
+
+    This runs on PreviewLoader's threads, so it only reads images with Qt from a path, and with Pillow from data in
+        memory (see _decode_image).
+
+    Returns:
+        _Preview: The image, or why it couldn't be read.
+    """
+    try:
+        if path.subpath:
+            with ZipFile(path.path) as zf:
+                info = zf.getinfo(path.subpath)
+                data = zf.read(info)
+            year, month, day, *_ = info.date_time
+            preview = _Preview(str(path.absolute()), info.file_size, f"{month}/{day}/{year}")
+            if path.is_gif:
+                preview.movie_data = QtCore.QByteArray(data)
+            else:
+                preview.image = _decode_image(data)
+        else:
+            file = Path(path.path)
+            st = file.stat()
+            modified = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).strftime('%m/%d/%Y')
+            preview = _Preview(str(file.absolute()), st.st_size, modified)
+            if path.is_gif:
+                preview.movie_data = QtCore.QByteArray(file.read_bytes())
+            else:
+                preview.image = QtGui.QImageReader(path.path).read()
+    except (OSError, KeyError, BadZipFile) as e:
+        # e.g. a file that was changed or deleted outside of the app
+        return _Preview(str(path), error=str(e))
+
+    return preview
+
+
+class PreviewCache:
+    """
+    The previews shown most recently, so that going back to one shows it straight away.
+
+    Up to `budget` bytes of them are kept: still images are kept decoded, and animations as their file's data.
+
+    Args:
+        budget (int): The most memory the previews can take up, in bytes.
+    """
+
+    def __init__(self, budget: int = PREVIEW_CACHE_BYTES):
+        self._budget = budget
+        self._size = 0
+        self._previews = OrderedDict()  # ZipPath -> _Preview, least recently used first
+
+    def get(self, path: ZipPath) -> _Preview | None:
+        """Get a preview, if it's kept"""
+        preview = self._previews.get(path)
+        if preview is not None:
+            self._previews.move_to_end(path)
+        return preview
+
+    def add(self, path: ZipPath, preview: _Preview):
+        """Make a preview that was just read ready to show, and keep it (unless it couldn't be read or is too big)"""
+        preview.ready()
+        if preview.error or (preview.pixmap is not None and preview.pixmap.isNull()) or preview.cost > self._budget:
+            # Images that couldn't be read aren't kept, so they're tried again the next time they're shown
+            return
+
+        self.forget(path)
+        self._previews[path] = preview
+        self._size += preview.cost
+        while self._size > self._budget:
+            _, oldest = self._previews.popitem(last=False)
+            self._size -= oldest.cost
+
+    def forget(self, path: ZipPath):
+        """Forget a preview, e.g. because its file was deleted or moved"""
+        preview = self._previews.pop(path, None)
+        if preview is not None:
+            self._size -= preview.cost
+
+
+class _PreviewJob(QtCore.QRunnable):
+    """Reads a preview on a PreviewLoader's thread pool"""
+
+    def __init__(self, path: ZipPath, number: int, started: set, read: QtCore.SignalInstance):
+        super().__init__()
+        self.path = path
+        self.number = number  # Which request this is for
+        self.started = started  # The loader's set of the requests that have started being read
+        self.read = read
+
+    def run(self):
+        """Read the preview, and hand it to the GUI thread"""
+        self.started.add(self.number)
+        try:
+            preview = _read_preview(self.path)
+        except Exception as e:  # ruff: ignore[blind-except]
+            # Anything unexpected (like running out of memory) mustn't leave the preview waiting forever
+            preview = _Preview(str(self.path), error=f"{type(e).__name__}: {e}")
+
+        with suppress(RuntimeError):  # The loader was deleted, i.e. the app is closing
+            self.read.emit(self.path, self.number, preview)
+
+
+class PreviewLoader(QtCore.QObject):
+    """
+    Reads previews on a thread pool, and keeps the ones shown most recently (see PreviewCache).
+
+    Reading a preview on the GUI thread froze the app until the image was read and decoded: ~80-160ms for a large photo
+        on a local disk, plus however long reading the file takes from a network drive.
+
+    A preview is read while its file is open, and Windows won't delete or move an open file. So call `wait` first.
+
+    Signals:
+        loaded(path: ZipPath, preview: _Preview): A preview asked for with `request` has been read (or couldn't be).
+    """
+    loaded = QtCore.Signal(ZipPath, object)
+    _read = QtCore.Signal(ZipPath, int, object)  # Emitted on the pool's threads, handled on the GUI's
+
+    def __init__(self, parent=None, *, threads: int = 2):
+        super().__init__(parent)
+        self._pool = QtCore.QThreadPool(self)
+        self._pool.setMaxThreadCount(threads)
+        self._cache = PreviewCache()
+        # Path -> the number of the request whose preview is wanted. A request's preview is dropped if its number isn't
+        #   here when it's read: it was cancelled (see cancel), or its file was deleted or moved (see forget)
+        self._wanted = {}
+        self._started = set()  # The numbers of the requests that have started being read
+        self._numbers = count(1)
+        self._read.connect(self._on_read)
+
+        # The pool waits for every queued preview when it's destroyed, so don't make closing wait for them too
+        app = QtCore.QCoreApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self.cancel)
+
+    def get(self, path: ZipPath) -> _Preview | None:
+        """Get a preview, if it's kept"""
+        return self._cache.get(path)
+
+    def request(self, path: ZipPath, *, priority: int = 1):
+        """Start reading a preview, unless it's kept or being read already. `loaded` is emitted once it's read"""
+        if path in self._wanted or self._cache.get(path) is not None:
+            return
+
+        number = next(self._numbers)
+        self._wanted[path] = number
+        self._pool.start(_PreviewJob(path, number, self._started, self._read), priority)
+
+    def cancel(self):
+        """Drop the requests that haven't started being read yet, e.g. because what they were for isn't shown anymore"""
+        self._pool.clear()
+        self._wanted = {path: number for path, number in self._wanted.items() if number in self._started}
+
+    def wait(self):
+        """Drop the requests that haven't started being read, and wait for the rest, so none of their files are open"""
+        self.cancel()
+        self._pool.waitForDone()
+
+    def forget(self, path: ZipPath):
+        """Forget a file's preview, and drop any read of it in progress, because the file was deleted or moved"""
+        self._wanted.pop(path, None)
+        self._cache.forget(path)
+
+    def _on_read(self, path: ZipPath, number: int, preview: _Preview):
+        """Keep a preview that was read, and pass it on, if it's still wanted"""
+        self._started.discard(number)
+        if self._wanted.get(path) != number:
+            return
+
+        del self._wanted[path]
+        self._cache.add(path, preview)
+        self.loaded.emit(path, preview)
 
 
 class ImageViewPane(QtWidgets.QWidget):
@@ -151,7 +402,9 @@ class ImageViewPane(QtWidgets.QWidget):
 
         # --- viewers ---
         self.current_path = None
-        self._buffer = self._qbytearray = None
+        self._shown = False  # Whether current_path's image is shown, or still being read
+        self._previews = PreviewLoader(self)
+        self._previews.loaded.connect(self._on_loaded)
         self.scaled = ScaledLabel(contentsMargins=NO_MARGIN, sizePolicy=MAX_SIZE_POLICY)
         self.scaled.setMinimumSize(10, 10)
 
@@ -194,81 +447,87 @@ class ImageViewPane(QtWidgets.QWidget):
 
         self.stack.setCurrentIndex(index)
 
-        if self.current_path:
-            self.set_image(self.current_path)
+        # Show the image again, in the view that is shown now. Clearing first takes it out of the other view (where a
+        #   movie would keep playing), and keeps set_image from skipping it as the image that's already shown
+        path = self.current_path
+        self.clear()
+        if path:
+            self.set_image(path)
 
         self.update()
 
     def clear(self):
-        """Clear and reset the current object, and the two sub-objects"""
+        """Clear both views, so no image is shown or current"""
+        self.current_path = None
+        self._shown = False
+        self._previews.cancel()  # The previews waiting to be read were for what was shown before
+
+        # Unlike ScaledLabel, a plain QLabel leaves its movie playing when cleared
+        movie = self.raw_label.movie()
         self.raw_label.clear()
+        if movie:
+            close_movie(movie)
         self.scaled.clear()
 
-        self.get_movie.cache_clear()
-        self.get_pixmap.cache_clear()
+    def forget(self, path: ZipPath):
+        """Forget a file's preview, because the file was deleted or moved"""
+        self._previews.forget(path)
 
-    @lru_cache(maxsize=5)  # ruff: ignore[cached-instance-method]
-    def get_movie(self, path: ZipPath) -> tuple[QtGui.QMovie, int, tuple]:
-        """Load a QMovie and details from either a zip or just the file system"""
-        file_size = modified = None
-        # We're setting a movie...
-        if path.subpath:
-            # Need to load movie from a zipfile
-            with ZipFile(path.path) as zf:
-                st = zf.getinfo(path.subpath)
-                modified = st.date_time
-                file_size = st.file_size
-                self._qbytearray = QtCore.QByteArray(zf.read(path.subpath))
-                self._buffer = QtCore.QBuffer(self._qbytearray)
-                self._buffer.open(QtCore.QIODevice.OpenModeFlag.ReadOnly)
+    def release_files(self):
+        """
+        Make sure no file is open for a preview: stop the previews waiting to be read, and wait for the ones being read.
 
-                movie = QtGui.QMovie()
-                movie.setDevice(self._buffer)
-        else:
-            # Basic movie path
-            movie = QtGui.QMovie(str(path.path))
+        Call this before deleting or moving files: Windows won't delete or move a file that's open.
+        """
+        self._previews.wait()
 
-        return movie, file_size, modified
-
-    @lru_cache(maxsize=10)  # ruff: ignore[cached-instance-method]
-    def get_pixmap(self, path: ZipPath) -> tuple[QtGui.QPixmap, int, tuple]:
-        """Load a QPixmap and details from either a zip or just the file system"""
-        file_size = modified = None
-        # We're setting an image...
-        if path.subpath:
-            # Need to load image from a zipfile
-            try:
-                with ZipFile(path.path) as zf:
-                    st = zf.getinfo(path.subpath)
-                    modified = st.date_time
-                    file_size = st.file_size
-                    pixmap = QtGui.QPixmap()
-                    pixmap.loadFromData(zf.read(path.subpath))
-            except KeyError:
-                return QtGui.QPixmap(), 0, ()
-        else:
-            # Basic image path
-            pixmap = QtGui.QPixmap(str(path.path))
-
-        return pixmap, file_size, modified
+    def prefetch(self, paths: Sequence[ZipPath]):
+        """Start reading previews that are likely to be shown next, after the current image's (if it's being read)"""
+        for path in paths[:PREFETCH_LIMIT]:
+            self._previews.request(path, priority=0)
 
     def set_image(self, path: ZipPath):
         """Set the image to show in the image view area. Can be an animated image."""
         if path == self.current_path:
             return
 
-        self.current_path = path
-        file_size = modified = None
-        extra = ''
         self.clear()
-        if path.is_gif:
-            movie, file_size, modified = self.get_movie(path)
-            object_size, uncompressed_size = movie_sizes(movie)
+        self.current_path = path
+        preview = self._previews.get(path)
+        if preview is None:
+            # It's shown once it has been read, by _on_loaded
+            self.status.set_elided_text(str(path), " (loading...)")
+            self._previews.request(path)
+            return
 
-            if self.stack.currentIndex() == 0:
-                self.scaled.setMovie(movie)
-            else:
-                self.raw_label.setMovie(movie)
+        self._show(preview)
+
+    def _on_loaded(self, path: ZipPath, preview: _Preview):
+        """A preview has been read, so show it if it's for the image that's current"""
+        if path == self.current_path and not self._shown:
+            self._show(preview)
+
+    def _show(self, preview: _Preview):
+        """Show the preview of the current image"""
+        self._shown = True
+        if preview.error:
+            self.status.set_elided_text(preview.path, f" (couldn't be read: {preview.error})")
+            return
+
+        extra = ''
+        if preview.movie_data is not None:
+            label = self.scaled if self.stack.currentIndex() == 0 else self.raw_label
+            # The movie belongs to the label that shows it, and its buffer belongs to the movie, so that neither one can
+            #   be deleted while something still uses it. A buffer kept by Python could be deleted before its movie
+            #   (e.g. as the app closed), and the movie crashed the app reading its next frame from it.
+            #   setData shares the file's data with the preview (QByteArrays copy by sharing), rather than copying it
+            movie = QtGui.QMovie(label)
+            buffer = QtCore.QBuffer(movie)
+            buffer.setData(preview.movie_data)
+            buffer.open(QtCore.QIODevice.OpenModeFlag.ReadOnly)
+            movie.setDevice(buffer)
+            object_size, uncompressed_size = movie_sizes(movie)
+            label.setMovie(movie)
 
             # WEBP files which aren't animated will appear as movies with a single frame
             #   Thats boring. For the purposes of the statusbar, just treat them as images
@@ -282,7 +541,7 @@ class ImageViewPane(QtWidgets.QWidget):
             movie.start()
         else:
             # Not an animated image, just a normal boring pixmap
-            pixmap, file_size, modified = self.get_pixmap(path)
+            pixmap = preview.pixmap
             extra = f'({human_bytes(pixmap.toImage().sizeInBytes())}) '
             object_size = pixmap.size()
 
@@ -296,24 +555,14 @@ class ImageViewPane(QtWidgets.QWidget):
 
         self.update()
 
-        # region Update status text
-        if not path.subpath:
-            path = Path(path.path)
-            st = path.stat()
-            modified = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).strftime('%m/%d/%Y')
-            file_size = st.st_size
-        elif modified:
-            modified = f"{modified[1]}/{modified[2]}/{modified[0]}"
-
         # If it doesn't fit, shorten the path rather than the details that are for comparing duplicates
         self.status.set_elided_text(
-            str(path.absolute()),
-            f" ({human_bytes(file_size)} {extra}"
+            preview.path,
+            f" ({human_bytes(preview.file_size)} {extra}"
             f"- {object_size.width()},{object_size.height()}px "
-            f"- {modified}"
+            f"- {preview.modified}"
             f")",
         )
-        # endregion
 
 
 class ScaledLabel(QtWidgets.QLabel):
@@ -332,13 +581,11 @@ class ScaledLabel(QtWidgets.QLabel):
         self.orig_movie = self.movie()
 
     def clear(self):
-        """Clear the label, make sure no files are left open"""
+        """Clear the label, and stop its movie"""
         super().clear()
         self.orig_pixmap = None
         if self.orig_movie:
-            self.orig_movie.device().close()
-            self.orig_movie.stop()
-            self.orig_movie.deleteLater()
+            close_movie(self.orig_movie)
             self.orig_movie = None
 
     def minimumSizeHint(self):
@@ -435,6 +682,8 @@ class ElidedLabel(QtWidgets.QLabel):
     """
     A one line label that shortens its text with "…" to fit its width, instead of growing to fit its text.
 
+    When the text is shortened, hovering the label shows the whole text.
+
     A long file path in the image preview's status used to force the preview pane (and the window) wider.
     """
 
@@ -465,13 +714,23 @@ class ElidedLabel(QtWidgets.QLabel):
         self._show_elided_text()
 
     def _show_elided_text(self):
-        """Show the text, shortened to fit"""
+        """Show the text, shortened to fit, with the whole text as a tooltip if it was shortened"""
         self.ensurePolished()  # So the font is the style sheet's (e.g. bold), which is wider
-        metrics = self.fontMetrics()
+        # Measure in fractions of a pixel. Rounded to whole pixels, the suffix could measure narrower than it is,
+        #   leaving the text a little too long and cutting off the end of the suffix
+        metrics = QtGui.QFontMetricsF(self.font())
         width = self.contentsRect().width()
-        text_width = max(0, width - metrics.horizontalAdvance(self._suffix))
-        text = metrics.elidedText(self._text, QtCore.Qt.TextElideMode.ElideMiddle, text_width)
-        super().setText(metrics.elidedText(text + self._suffix, QtCore.Qt.TextElideMode.ElideRight, width))
+        suffix_width = metrics.horizontalAdvance(self._suffix)
+        if suffix_width <= width:
+            text = metrics.elidedText(self._text, QtCore.Qt.TextElideMode.ElideMiddle, width - suffix_width)
+            text += self._suffix
+        else:
+            # Not even the suffix fits
+            text = metrics.elidedText(self._suffix, QtCore.Qt.TextElideMode.ElideRight, width)
+
+        super().setText(text)
+        full_text = self._text + self._suffix
+        self.setToolTip(full_text if text != full_text else '')
 # endregion
 
 
@@ -586,6 +845,11 @@ class ThumbnailLoader(QtCore.QObject):
         self._pool.clear()
         self._pending.clear()
 
+    def wait(self):
+        """Stop loading thumbnails that haven't started, and wait for the rest, so none of their files are open"""
+        self.cancel()
+        self._pool.waitForDone()
+
     def _start_zip_jobs(self):
         """
         Start loading the images in zips that were asked for.
@@ -679,6 +943,9 @@ class ThumbnailTile(QtWidgets.QFrame):
         path: Image path (opaque identifier for the caller).
         stateChanged(path: str, state: SelectionValue): Emitted on state updates.
         hovered(path: str): Emitted on cursor hovering over thumbnail tile.
+        menuAction(action: str, path: ZipPath): Emitted when a context menu entry that acts on more than this tile, or
+            needs more than this tile to act, is chosen. `action` is one of the TileAction names.
+            MainWindow.on_tile_menu_action handles these.
     """
     stateChanged = QtCore.Signal(ZipPath, SelectionValue)
     hovered = QtCore.Signal(ZipPath)
@@ -863,6 +1130,7 @@ class DuplicateGroupRow(QtWidgets.QWidget):
     Signals:
         tileStateChanged(path: ZipPath, state: SelectionValue)
         tileHovered(path: ZipPath)
+        tileMenuAction(action: str, path: ZipPath): See ThumbnailTile.menuAction
     """
     tileStateChanged = QtCore.Signal(ZipPath, SelectionValue)
     tileHovered = QtCore.Signal(ZipPath)
@@ -936,9 +1204,8 @@ class DuplicateGroupList(QtWidgets.QWidget):
 
     groupTileStateChanged = QtCore.Signal(ZipPath, SelectionValue)  # path, state
     groupTileHovered = QtCore.Signal(ZipPath)
+    groupTileMenuAction = QtCore.Signal(str, ZipPath)  # action, path. See ThumbnailTile.menuAction
     pageIndicatorClicked = QtCore.Signal()
-
-    groupTileMenuAction = QtCore.Signal(str, ZipPath)
 
     def __init__(self, parent=None, *, max_rows: int = 25, thumb_size: int = 64, **kwargs):
         super().__init__(parent, **kwargs)
@@ -1033,18 +1300,276 @@ class DuplicateGroupList(QtWidgets.QWidget):
             row.setParent(None)
             row.deleteLater()
         self._rows.clear()
+
+    def release_files(self):
+        """
+        Make sure no file is open for a thumbnail: stop the thumbnails waiting to load, and wait for the ones loading.
+
+        Call this before deleting or moving files: Windows won't delete or move a file that's open.
+        """
+        self._thumbnails.wait()
+
+    def group_around(self, path: ZipPath) -> list[ZipPath]:
+        """
+        The other images in the row (group) that has `path`, nearest to it first.
+
+        Returns:
+            list[ZipPath]: The images, or an empty list if `path` isn't on this page.
+        """
+        for row in self._rows:
+            paths = [tile.path for tile in row.tiles()]
+            if path in paths:
+                i = paths.index(path)
+                # By distance, and the one to the right first when two are as near
+                nearest = sorted(range(len(paths)), key=lambda j: (abs(j - i), j < i))
+                return [paths[j] for j in nearest if j != i]
+
+        return []
 # endregion
+
+
+class _FolderIconProvider(QtWidgets.QFileIconProvider):
+    """
+    Icons for the folder tree, without working out a type for every file.
+
+    As a folder loads, QFileSystemModel asks for the type of everything in it (like "JPEG image") on the GUI thread,
+        including the files it then hides. That's a MIME lookup per file: System32's ~5000 files froze the GUI for ~1s.
+        The tree doesn't show types, so any type will do.
+    """
+
+    def type(self, info: QtCore.QFileInfo) -> str:
+        """
+        A type that's quick to work out.
+
+        Returns:
+            str: "Folder" or "File". It can't be empty: QFileSystemModel only shows a new entry once its details
+                differ from those of its placeholder, which has no type. So with empty types no folder would show up.
+        """
+        return "Folder" if info.isDir() else "File"
+
+
+def _is_hidden(entry: os.DirEntry) -> bool:
+    """Is this hidden, as QDir decides it? That's the hidden attribute on Windows, and a leading dot elsewhere"""
+    if sys.platform == "win32":
+        return bool(entry.stat().st_file_attributes & stat.FILE_ATTRIBUTE_HIDDEN)
+
+    if sys.platform == "darwin" and entry.stat().st_flags & stat.UF_HIDDEN:
+        return True
+
+    return entry.name.startswith(".")
+
+
+def _has_shown_subfolder(path: str, *, include_hidden: bool) -> bool:
+    """
+    Does this folder have a subfolder that the folder tree would show? This stops looking at the first one.
+
+    Shortcuts (.lnk files) don't count. Qt shows shortcuts to folders as folders, but pixmatch can't scan them,
+        and resolving them is slow (seconds for a desktop full of them).
+
+    Returns:
+        bool: Whether it has one. False if the folder can't be read, like QDir.
+    """
+    with suppress(OSError), os.scandir(path) as entries:
+        for entry in entries:
+            with suppress(OSError):
+                if entry.is_dir() and (include_hidden or not _is_hidden(entry)):
+                    return True
+
+    return False
 
 
 class DirFileSystemModel(QtWidgets.QFileSystemModel):
     """
-    Custom FileSystemModel.
+    Custom FileSystemModel, which only shows an expand arrow for folders that have subfolders.
 
-    This is required so that if a directory is opened and it has no children, it still shows as opened...
+    QFileSystemModel gives every folder an arrow, and once a folder with no subfolders is opened it still shows one.
+    The tree asks again about every folder it shows each time it lays itself out, so looking in each folder on the GUI
+        thread froze it in big folders. Instead folders are looked in on worker threads, and get their arrow then.
+    Once Qt has loaded a folder's contents (opening it does that), those are used instead, as Qt keeps them up to date.
+        Qt doesn't watch folders that haven't been opened though, see recheck_children for those.
+
+    Folders are kept track of by their indexes' internalId, which points at Qt's record of the folder: working out a
+        folder's path took most of the time of hasChildren, which is called hundreds of thousands of times while a big
+        folder loads (and finding a folder's index from its path took ~1ms). Qt reuses those ids once a folder is
+        removed, so removed folders are forgotten before then.
+    Folders waiting to be looked in keep their row rather than a QPersistentModelIndex: Qt updates those each time it
+        sorts a folder (which it does as a folder loads), and with thousands of them that froze it for seconds.
     """
 
+    # Folders are looked in on more than one thread, so one that's slow to read (like an offline network drive)
+    #   doesn't hold up the rest
+    CHECK_THREADS = 2
+
+    _checked = QtCore.Signal(list)  # [(id, path, generation, has subfolders)], emitted on the worker threads
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._icon_provider = _FolderIconProvider()  # Kept here, as the model doesn't keep it alive
+        self.setIconProvider(self._icon_provider)
+
+        self._loaded = set()  # Folders whose contents Qt has finished loading
+        self._has_subfolders = {}  # Folders that have been looked in -> whether they have subfolders
+        self._stale = {}  # Answers from before the filter changed, shown until their folders are looked in again
+        self._pending = {}  # Folders waiting to be looked in -> (their path, their folder's id, their row)
+        self._parents = {}  # Folders of folders that have been asked about -> their index (0 is the drives' folder)
+        self._rows = {}  # Folders -> {the id of each folder in it: its row}, when looked up (until rows change)
+        self._generation = 0  # Changes with the filter, so answers found with the old filter are thrown away
+        self._requests = queue.SimpleQueue()  # (id, path, generation, include hidden folders)
+
+        self.directoryLoaded.connect(self._on_directory_loaded)
+        self.rowsAboutToBeRemoved.connect(self._forget_rows)
+        self.modelAboutToBeReset.connect(self._forget_all)
+        for rows_changed in (self.rowsInserted, self.rowsRemoved, self.layoutChanged):
+            rows_changed.connect(self._rows.clear)
+        self._checked.connect(self._on_checked)
+        for _ in range(self.CHECK_THREADS):
+            threading.Thread(target=self._check_folders, daemon=True).start()
+
+    def setFilter(self, filters: QtCore.QDir.Filter):
+        """Set the filter. Whether a folder has subfolders can change with it (hidden ones), so look again"""
+        super().setFilter(filters)
+        self._generation += 1
+        self._stale.update(self._has_subfolders)
+        self._has_subfolders.clear()
+
     def hasChildren(self, /, parent: QtCore.QModelIndex | QtCore.QPersistentModelIndex = ...):
-        """Return true only if there are files as children"""
-        file_info = self.fileInfo(parent)
-        dir_ = QtCore.QDir(file_info.absoluteFilePath())
-        return bool(dir_.entryList(self.filter()))
+        """Return true if the folder has subfolders. Until it has been looked in, return false"""
+        if not parent.isValid() or parent.column() > 0:
+            return super().hasChildren(parent)
+
+        folder = parent.internalId()
+        if folder in self._loaded:
+            return self.rowCount(parent) > 0
+
+        has_subfolders = self._has_subfolders.get(folder)
+        if has_subfolders is None:
+            self._request(parent)
+            return self._stale.get(folder, False)
+
+        return has_subfolders
+
+    def recheck_children(self, parent: QtCore.QModelIndex):
+        """
+        Look again in the folders in a folder, to update their arrows. They keep the arrows they have until then.
+
+        This is for the tree's expanded signal: Qt doesn't watch folders that haven't been opened, so this is how their
+            arrows catch up with subfolders made or deleted outside of the app.
+        """
+        for row in range(self.rowCount(parent)):
+            index = self.index(row, 0, parent)
+            if index.internalId() in self._has_subfolders and index.internalId() not in self._loaded:
+                self._request(index)
+
+    def _request(self, index: QtCore.QModelIndex):
+        """Have a folder looked in, unless it's already waiting to be"""
+        folder = index.internalId()
+        if folder in self._pending:
+            return
+
+        parent = index.parent()
+        parent_id = parent.internalId()  # 0 for the drives, whose folder is the (invalid) root index
+        if parent_id not in self._parents:
+            self._parents[parent_id] = QtCore.QPersistentModelIndex(parent)
+        path = self.filePath(index)
+        self._pending[folder] = (path, parent_id, index.row())
+        self._requests.put((folder, path, self._generation, bool(self.filter() & QtCore.QDir.Filter.Hidden)))
+
+    def _check_folders(self):
+        """Look in folders as they're asked for (on a worker thread), and hand back what was found in batches"""
+        while True:
+            request = self._requests.get()
+            found = []
+            batch_end = time.monotonic() + 0.02  # Up to 20ms of answers go to the GUI thread together
+            while request is not None:
+                folder, path, generation, include_hidden = request
+                found.append((folder, path, generation, _has_shown_subfolder(path, include_hidden=include_hidden)))
+                request = None
+                if time.monotonic() < batch_end:
+                    with suppress(queue.Empty):
+                        request = self._requests.get_nowait()
+
+            with suppress(RuntimeError):  # The model was deleted, i.e. the app is closing
+                self._checked.emit(found)
+
+    def _on_checked(self, found: list):
+        """Keep what the worker threads found, and update the arrows that changed"""
+        changed = defaultdict(list)  # Folders' ids -> the (id, row) of the folders in them to update
+        for folder, path, generation, has_subfolders in found:
+            pending = self._pending.get(folder)
+            if pending is None or pending[0] != path:
+                continue  # The folder was removed while it was looked in (and its id may be another folder's now)
+
+            del self._pending[folder]
+            _, parent_id, row = pending
+            if generation == self._generation:
+                had_subfolders = self._has_subfolders.get(folder, self._stale.pop(folder, False))
+                self._has_subfolders[folder] = has_subfolders
+                if has_subfolders == had_subfolders:
+                    continue
+            # Otherwise the filter changed while it was looked in. Updating it has the tree ask again, which looks again
+
+            changed[parent_id].append((folder, row))
+
+        for parent_id, folders in changed.items():
+            self._update_rows(parent_id, folders)
+
+    def _update_rows(self, parent_id: int, folders: list):
+        """Have the tree ask again whether some folders in a folder have subfolders"""
+        if parent_id and parent_id not in self._loaded:
+            # The tree asks about every row again each time a loading folder gets more, and once it's loaded
+            #   (see _on_directory_loaded). Its rows also move as Qt sorts them, so they couldn't be updated one by one
+            return
+
+        parent = self._parents.get(parent_id)
+        if parent is None or (parent_id and not parent.isValid()):
+            return  # Their folder was removed
+
+        parent = self.index(parent.row(), 0, parent.parent()) if parent_id else QtCore.QModelIndex()
+        for folder, row in folders:
+            index = self.index(row, 0, parent)
+            if index.internalId() != folder:
+                # It moved since it was asked about (like when Qt sorted the folder), so look its row up
+                rows = self._rows.get(parent_id)
+                if rows is None:
+                    rows = {self.index(r, 0, parent).internalId(): r for r in range(self.rowCount(parent))}
+                    self._rows[parent_id] = rows
+                if folder not in rows:
+                    continue
+                index = self.index(rows[folder], 0, parent)
+
+            self.dataChanged.emit(index, index)
+
+    def _on_directory_loaded(self, path: str):
+        """
+        Qt has loaded a folder's contents, so have the tree check the folder's arrow against them.
+
+        The arrows of the folders in it are updated too, for what was found about them while it loaded.
+        """
+        index = self.index(path)
+        if index.isValid():
+            self._loaded.add(index.internalId())
+            self.dataChanged.emit(index, index)
+            rows = self.rowCount(index)
+            if rows:
+                self.dataChanged.emit(self.index(0, 0, index), self.index(rows - 1, 0, index))
+
+    def _forget_rows(self, parent: QtCore.QModelIndex, first: int, last: int):
+        """Forget folders that are about to be removed (and the folders in them), before Qt reuses their ids"""
+        indexes = [self.index(row, 0, parent) for row in range(first, last + 1)]
+        while indexes:
+            index = indexes.pop()
+            folder = index.internalId()
+            self._has_subfolders.pop(folder, None)
+            self._stale.pop(folder, None)
+            self._pending.pop(folder, None)
+            self._parents.pop(folder, None)
+            self._loaded.discard(folder)
+            indexes.extend(self.index(row, 0, index) for row in range(self.rowCount(index)))
+
+    def _forget_all(self):
+        """Forget every folder, as the model is being reset"""
+        self._loaded.clear()
+        self._has_subfolders.clear()
+        self._stale.clear()
+        self._pending.clear()
+        self._parents.clear()

@@ -2,6 +2,7 @@
 
 
 import logging
+import os
 import shutil
 import time
 
@@ -10,10 +11,11 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Iterable
 
+from PIL import ImageFile
 from PySide6 import QtCore, QtGui, QtWidgets
 from send2trash import send2trash
 
-from pixmatch import Finished, ImageMatch, ImageMatcher, NewGroup, NewMatch, ZipPath, _is_under
+from pixmatch import Finished, ImageMatcher, NewGroup, NewMatch, ZipPath, _is_under, has_image_outside_zips
 from pixmatch.gui.utils import MAX_SIZE_POLICY, NO_MARGIN
 from pixmatch.gui.widgets import (
     DirFileSystemModel,
@@ -26,7 +28,17 @@ from pixmatch.gui.widgets import (
 )
 from pixmatch.utils import human_bytes
 
+# Allow damaged images. This Pillow setting applies to the whole process, so the app sets it rather than pixmatch
+#   setting it for anything that imports it. ImageMatcher passes it on to the processes that hash images.
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
 ICON_PATH = Path(__file__).resolve().parent / 'pixmatch.ico'
+
+# The options that hide groups, as they're named in the Options menu, and the group filter each one turns on
+#   (see ImageMatcher.set_group_filters)
+GROUP_FILTER_OPTIONS = {
+    "Hide groups only in zips": has_image_outside_zips,
+}
 
 logger = logging.getLogger(__name__)
 
@@ -56,17 +68,17 @@ class WorkerSignals(QtCore.QObject):
     Signals from a running worker thread.
 
     new_group
-        Signaled when a new match group is found.
+        Signaled with the NewGroup event when a new match group is found.
 
     new_match
-        Signaled when a new match is found.
+        Signaled with the NewMatch event when a new match is found.
 
     finish
         Signaled when execution is finished, and was not killed.
     """
 
     new_group = QtCore.Signal(object)
-    new_match = QtCore.Signal(tuple)
+    new_match = QtCore.Signal(object)
     finish = QtCore.Signal()
 
 
@@ -91,9 +103,9 @@ class ProcessorThread(QtCore.QRunnable):
         while not self.processor.events.empty():
             evt = self.processor.events.get_nowait()
             if isinstance(evt, NewGroup):
-                self.signals.new_group.emit(evt.group)
+                self.signals.new_group.emit(evt)
             elif isinstance(evt, NewMatch):
-                self.signals.new_match.emit((evt.group, evt.path))
+                self.signals.new_match.emit(evt)
             elif isinstance(evt, Finished):
                 self._poller.stop()
                 self.signals.finish.emit()
@@ -151,6 +163,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.deleted_files_count = 0
         self.deleted_files_size = 0
         self.current_page: int = 1
+        # The seq of the last event the page already has (see update_group_list). Reset it if the processor is replaced
+        self._page_seq = 0
         self.processor = None
         self.file_states = {}
         self._threadpool = QtCore.QThreadPool()
@@ -291,6 +305,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # ... = QtGui.QAction("Between folders only", self)
         # ... = QtGui.QAction("Loosen filter automatically", self)
 
+        # Each option that hides groups turns on a group filter, see group_filters
+        self._group_filter_options = []  # (option, its group filter)
+        for text, group_filter in GROUP_FILTER_OPTIONS.items():
+            option = QtGui.QAction(text, self, checkable=True)
+            option.triggered.connect(self.change_group_filters)
+            self._group_filter_options.append((option, group_filter))
+
         option_hidden_folders.triggered.connect(self.change_hidden_folders_state)
         option_recycle.triggered.connect(self.change_recycle_state)
 
@@ -299,6 +320,9 @@ class MainWindow(QtWidgets.QMainWindow):
         options_menu.addAction(option_subfolders)
         options_menu.addSeparator()
         options_menu.addAction(option_rotations)
+        options_menu.addSeparator()
+        for option, _ in self._group_filter_options:
+            options_menu.addAction(option)
         options_menu.addSeparator()
         options_menu.addAction(option_recycle)
         # endregion
@@ -470,8 +494,32 @@ class MainWindow(QtWidgets.QMainWindow):
         filter_tab.addLayout(filter_tab_main)
         # endregion
 
+        # region Settings tab
+        cpus = os.cpu_count() or 1
+        self._cpu_label = QtWidgets.QLabel()
+        self.cpu_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal,
+                                            tickPosition=QtWidgets.QSlider.TickPosition.TicksBelow)
+        self.cpu_slider.setRange(1, cpus)
+        self.cpu_slider.setPageStep(1)
+        self.cpu_slider.setTickInterval(1)
+        self.cpu_slider.setValue(max(1, cpus))
+        self.cpu_slider.valueChanged.connect(self.on_cpu_adjust)
+        self.on_cpu_adjust(self.cpu_slider.value())
+
+        settings_tab = QtWidgets.QVBoxLayout()
+        settings_tab.addWidget(self._cpu_label)
+        settings_tab.addWidget(self.cpu_slider)
+        settings_tab.addWidget(QtWidgets.QLabel(
+            text="How many of the computer's CPUs a scan uses. Using fewer leaves more of the computer free "
+                 "for other things, but the scan takes longer. This can't be changed while a scan is running.",
+            wordWrap=True,
+        ))
+        settings_tab.addStretch(1)
+        # endregion
+
         such = QtWidgets.QTabWidget()
         such.addTab(QtWidgets.QWidget(layout=filter_tab), "Filter")
+        such.addTab(QtWidgets.QWidget(layout=settings_tab), "Settings")
         # endregion
 
         labels_and_such = QtWidgets.QHBoxLayout()
@@ -493,9 +541,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.file_system_model = DirFileSystemModel()
         self.change_hidden_folders_state(checked=False)
         self.file_system_model.setRootPath("")
-        self.file_system_view = QtWidgets.QTreeView(headerHidden=True)
+        # Every row is the same height, and saying so lets the tree skip measuring each one
+        #   (updating one folder's arrow took ~2ms in a folder of 20,000 folders, and 15us like this)
+        self.file_system_view = QtWidgets.QTreeView(headerHidden=True, uniformRowHeights=True)
         self.file_system_view.setContentsMargins(NO_MARGIN)
         self.file_system_view.setModel(self.file_system_model)
+        self.file_system_view.expanded.connect(self.file_system_model.recheck_children)
         self.file_system_view.setRootIndex(self.file_system_model.index(""))
         self.file_system_view.hideColumn(1)  # Size
         self.file_system_view.hideColumn(2)  # Type
@@ -627,12 +678,8 @@ class MainWindow(QtWidgets.QMainWindow):
         """The regroup finished, so show the new groups"""
         self._end_regroup()
 
-        # A file is only marked while it has a duplicate (see set_file_state).
-        #   Some files lost theirs at this strength, so those markings no longer apply
-        self.file_states = {
-            path: state for path, state in self.file_states.items()
-            if state.state != SelectionState.MARK or self._has_duplicate(path)
-        }
+        # Some files lost their duplicates at this strength
+        self._drop_marks_without_duplicates()
 
         self.current_page = 1
         self.update_group_list()
@@ -671,6 +718,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def reset_scan(self):
         """Throw out the loaded scan, its groups and its markings"""
         self.processor = None
+        self._page_seq = 0  # The next scan's events are numbered from the start again
         self._regroup_failed = False
         self.file_states = {}
         self.current_page = 1
@@ -680,6 +728,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.duplicate_group_list.set_groups([])
         self.duplicate_group_list.update_page_indicator(1, 1)
         self.statusBar().clearMessage()
+
+    def on_cpu_adjust(self, value: int):
+        """The CPU slider has been adjusted, so show its new value"""
+        self._cpu_label.setText(f"CPUs to use: {value} of {self.cpu_slider.maximum()}")
 
     def on_pause(self, e):
         """Pause button has been pressed, so pause"""
@@ -707,6 +759,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if not e:
             return
 
+        target_paths = self.file_paths_selected()
+        if not target_paths and (not self.processor or self.processor.is_finished()):
+            # This click would start a scan, and there's nothing to scan. It checked Start though, so check Stop again
+            self.stop_btn.setChecked(True)
+            return
+
         if self.processor and self.processor.is_finished() and (
                 self._regroup_failed or self.processor.exact_match != self.hash_match_chkbx.isChecked()):
             # The loaded hashes can't be used with these settings, so this has to be a whole new scan
@@ -722,6 +780,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 strength=self.precision_slider.value(),
                 exact_match=self.hash_match_chkbx.isChecked(),
                 rotation=self.rotation_wanted(),
+                group_filters=self.group_filters(),
             )
 
         elif self.processor.is_paused() and not self.processor.is_finished():
@@ -732,10 +791,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self._label_timer.start()
             return
 
-        elif self.processor.running():
-            raise RuntimeError("Somehow we're trying to run when the processor appears to be running already!")
+        elif not self.processor.is_finished():
+            # Already running. Start stays checked when it's clicked again, but the click still gets here
+            return
 
-        target_paths = self.file_paths_selected()
+        # Each scan makes its own pool of processes when it starts, so this is when a new CPU setting takes effect
+        self.processor.processes = self.cpu_slider.value()
 
         self._thread = ProcessorThread(self.processor, target_paths)
         self._thread.signals.new_group.connect(self.on_new_match_group_found)
@@ -746,6 +807,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.precision_slider.setEnabled(False)
         self.hash_match_chkbx.setEnabled(False)
         self.rotation_chkbx.setEnabled(False)
+        self.cpu_slider.setEnabled(False)
         self._run_timer.start()
         self._label_timer.start()
         return
@@ -765,12 +827,17 @@ class MainWindow(QtWidgets.QMainWindow):
     @property
     def total_pages(self):
         """How many pages are there in the duplicate group list"""
+        if not self.processor:
+            # Nothing has been scanned yet, so there's only the one empty page
+            return 1
+
         return ceildiv(len(self.processor.matches), self.duplicate_group_list._max_rows) or 1
 
     def on_finish(self):
         """Finish callback, to update GUI when processing has completed"""
         self.stop_btn.setChecked(True)
         self.pause_btn.setEnabled(False)
+        self.cpu_slider.setEnabled(True)
         self._run_timer.stop()
         self._label_timer.stop()
         self._thread = None
@@ -781,28 +848,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.rotation_chkbx.setEnabled(not self.hash_match_chkbx.isChecked())
         self.on_precision_adjust(self.precision_slider.value())
 
-    def on_new_match_group_found(self, match_group: ImageMatch):
+    def on_new_match_group_found(self, event: NewGroup):
         """New match group found callback, update the GUI with new match group"""
-        page_this_belongs_on, _ = divmod(match_group.match_i, self.duplicate_group_list._max_rows)
+        page_this_belongs_on, _ = divmod(event.group.match_i, self.duplicate_group_list._max_rows)
         self.duplicate_group_list.update_page_indicator(self.current_page, self.total_pages)
 
-        if self.current_page == page_this_belongs_on + 1:
-            self.duplicate_group_list.add_group(match_group.matches)
+        # If the page was rebuilt after this event was sent, it already has this group
+        if event.seq > self._page_seq and self.current_page == page_this_belongs_on + 1:
+            self.duplicate_group_list.add_group(event.group.matches)
 
         self.set_duplicate_groups_label(len(self.processor.matches))
 
-    def on_new_match_found(self, response):
+    def on_new_match_found(self, event: NewMatch):
         """New match found callback, update the GUI with new match"""
-        # First we must decompose the response
-        #   TODO: Can I just create a callback with 2 args?
-        match_group: ImageMatch
-        new_match: ZipPath
-        match_group, new_match = response
+        page_this_belongs_on, row_this_is = divmod(event.group.match_i, self.duplicate_group_list._max_rows)
 
-        page_this_belongs_on, row_this_is = divmod(match_group.match_i, self.duplicate_group_list._max_rows)
-
-        if self.current_page == page_this_belongs_on + 1:
-            self.duplicate_group_list._rows[row_this_is].add_tile(new_match)
+        # If the page was rebuilt after this event was sent, it already has this image
+        if event.seq > self._page_seq and self.current_page == page_this_belongs_on + 1:
+            self.duplicate_group_list._rows[row_this_is].add_tile(event.path)
 
         self.set_duplicate_images_label(self.processor.duplicate_images)
 
@@ -820,6 +883,23 @@ class MainWindow(QtWidgets.QMainWindow):
     def change_recycle_state(self, checked: bool):  # ruff: ignore[boolean-type-hint-positional-argument]
         """Change the 'Use recycle bin' state"""
         self.recycle = checked
+
+    def group_filters(self) -> list:
+        """The group filters of the options that hide groups (in the Options menu) which are checked"""
+        return [group_filter for option, group_filter in self._group_filter_options if option.isChecked()]
+
+    def change_group_filters(self, *_):
+        """An option that hides groups was checked or unchecked, so show the groups that the options don't hide"""
+        if not self.processor:
+            return  # The scan gets them when it starts
+
+        self.processor.set_group_filters(self.group_filters())
+        # Delete and Move would act on marked files in groups that are hidden now, without them being seen
+        self._drop_marks_without_duplicates()
+        # If there are fewer pages now, stay on the last one
+        self.current_page = min(self.current_page, self.total_pages)
+        self.update_group_list()
+        self.update_labels()
 
     def set_duplicate_groups_label(self, duplicate_groups: int):
         """Set the duplicate groups count label"""
@@ -982,7 +1062,8 @@ class MainWindow(QtWidgets.QMainWindow):
         Set the state of a single file. Every state change should go through here.
 
         Files are only marked (for the Delete and Move actions) while they are in a match group, i.e. they have a
-            duplicate, so bulk actions like "Ignore zip" can't mark files that have no duplicate.
+            duplicate and their group isn't hidden, so bulk actions like "Ignore zip" can't mark files that have no
+            duplicate, or that are hidden.
         Files in zips are read-only, so they are never marked:
             deleting or moving them would act on the zip itself, not the file inside it.
         """
@@ -995,6 +1076,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.file_states[path] = state
 
+    def _drop_marks_without_duplicates(self):
+        """
+        A file is only marked while it has a duplicate (see set_file_state), so drop the markings of files that don't
+            anymore: after regrouping, or after hiding groups.
+        """
+        with self.processor.paused():
+            self.file_states = {
+                path: state for path, state in self.file_states.items()
+                if state.state != SelectionState.MARK or self._has_duplicate(path)
+            }
+
     def _has_duplicate(self, path: ZipPath) -> bool:
         """Is this file in a match group?"""
         hash_ = self.processor._reverse_hashes.get(path)
@@ -1004,19 +1096,18 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         Mark several files as a particular state, then update the tiles.
 
-        Processing is paused before `paths` is iterated, so it can be a generator over the processor's data.
+        Processing is paused while `paths` is iterated, so it can be one of the processor's lists. A generator over the
+            processor's data must be made inside a `with self.processor.paused():` block too, since a generator
+            expression takes its iterator over that data as soon as it's made (and it could change before the pause).
         """
         if not self.processor:
             return
 
-        currently_paused = self.processor.conditional_pause()
-        try:
+        with self.processor.paused():
             for path in paths:
                 self.set_file_state(path, state)
 
             self.update_selection_states()
-        finally:
-            self.processor.conditional_resume(currently_paused)
 
     def mark_group(self, path, selection: SelectionValue):
         """Mark all files in a group with path as a particular state"""
@@ -1047,7 +1138,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mark_zip(current_zip_path, SelectionValues.IGNORE)
 
     def mark_unmark_zip(self, target_path: ZipPath | None = None):
-        """Mark all files in a zip as ignore"""
+        """Mark all files in a zip as keep"""
         current_zip_path = target_path or self.image_view_area.current_path
         self.mark_zip(current_zip_path, SelectionValues.KEEP)
     # endregion
@@ -1130,8 +1221,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.processor:
             return
 
-        is_paused = self.processor.conditional_pause()
         self.image_view_area.clear()
+        # Previews and thumbnails are read in the background with their files open, and Windows won't delete or move an
+        #   open file
+        self.image_view_area.release_files()
+        self.duplicate_group_list.release_files()
         failed = []
         try:
             if move:
@@ -1161,16 +1255,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self.current_page = min(self.current_page, self.total_pages)
             self.update_labels()
             self.update_group_list()
-            self.processor.conditional_resume(is_paused)
 
         if failed:
             QtWidgets.QMessageBox.warning(self, "Delete", "Couldn't delete:\n" + "\n".join(failed))
 
     def _forget(self, path: ZipPath):
-        """Take a file that was moved or deleted out of the results, along with any marking it had"""
+        """Take a file that was moved or deleted out of the results, along with any marking and preview it had"""
         self.file_states.pop(path, None)
-        if path in self.processor._reverse_hashes:
-            self.processor.remove(path)
+        self.image_view_area.forget(path)
+        with self.processor.paused():
+            if path in self.processor._reverse_hashes:
+                self.processor.remove(path)
     # endregion
 
     def update_group_list(self):
@@ -1178,22 +1273,34 @@ class MainWindow(QtWidgets.QMainWindow):
         self.image_view_area.clear()
 
         row_count = self.duplicate_group_list._max_rows
-        self.duplicate_group_list.set_groups(
-            [m.matches
-             for m in self.processor.matches[(self.current_page - 1) * row_count:self.current_page * row_count]],
-        )
+        page_start = (self.current_page - 1) * row_count
+        with self.processor.paused():
+            # The page is built from the processor's data as it is now, which has the changes of every event sent so
+            #   far. So events that are still queued are skipped when they arrive, by their seq. Later events are
+            #   added to the page, and their groups' numbers (match_i) are current: groups are only renumbered by
+            #   removing files, and that always rebuilds the page after.
+            #   The groups are copied, since they keep changing after this
+            self._page_seq = self.processor.events_sent
+            groups = [list(m.matches) for m in self.processor.matches[page_start:page_start + row_count]]
 
+        self.duplicate_group_list.set_groups(groups)
         self.update_selection_states()
         self.duplicate_group_list.update_page_indicator(self.current_page, self.total_pages)
 
     def change_file_state(self, path: ZipPath, state: SelectionValue):
         """A tile has been clicked and the match state was changed"""
+        if not path:
+            # The Edit menu acts on the image being previewed, and there isn't one: no image has been hovered over
+            #   since the app started or the preview was last cleared (e.g. by changing page)
+            return
         self.set_file_state(path, state)
         self.update_selection_states()
 
     def on_tile_hover(self, path: ZipPath):
         """A tile has been hovered over, so handle that logic"""
         self.image_view_area.set_image(path)
+        # Its duplicates are what's most likely to be looked at next, so read them in the background too
+        self.image_view_area.prefetch(self.duplicate_group_list.group_around(path))
         self.mark_menu.setEnabled(not path.is_zip)
         self.mark_ignore_zip_menu.setEnabled(path.is_zip)
 
@@ -1272,11 +1379,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.selected_file_path_display.setCurrentIndex(self.selected_file_path_display.indexFromItem(item))
 
     def file_path_down_clicked(self, _):
-        """Move the selected directory up in the ordering"""
+        """Move the selected directory down in the ordering"""
         # TODO: If the path has already been loaded for processing in the processor, then this won't do much
         for selected_index in self.selected_file_path_display.selectedIndexes():
             row = selected_index.row()
-            if row == self.selected_file_path_display.count():
+            if row == self.selected_file_path_display.count() - 1:
                 continue
 
             item = self.selected_file_path_display.takeItem(row)
@@ -1291,13 +1398,13 @@ class MainWindow(QtWidgets.QMainWindow):
             target_path = info.filePath()
             self.selected_file_path_display.addItem(target_path)
 
-            if self.processor and self.processor.running():
+            # A scan that is in progress is told about the folder, even a paused one (it gets to the folder once it's
+            #   resumed). With no scan in progress, the next one starts with every folder listed
+            if self.processor and not self.processor.is_finished():
                 self.processor.add_path(target_path)
 
     def file_path_out_clicked(self, _):
         """Move the selected directory out of processing"""
-        # TODO: If the path has already been loaded for processing in the processor then all of the images
-        #   will still need to be hashed before the callback will discard the results...
         for selected_index in self.selected_file_path_display.selectedIndexes():
             selected_item = self.selected_file_path_display.takeItem(selected_index.row())
 
@@ -1393,6 +1500,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         is_paused = self.processor.conditional_pause()
         self.image_view_area.clear()
+        # Previews and thumbnails are read in the background with their files open, and Windows won't delete or move an
+        #   open file
+        self.image_view_area.release_files()
+        self.duplicate_group_list.release_files()
 
         file_size_deleted = 0
         file_count_deleted = 0
@@ -1404,48 +1515,53 @@ class MainWindow(QtWidgets.QMainWindow):
         skipped_files = []
 
         try:
-            for file in to_process:
-                if file.is_zip and action != FileAction.IGNORE:
-                    # set_file_state never allows this, but acting on file.path_obj would delete or move the WHOLE zip
-                    logger.warning("Refusing to %s %s, files in zips are read-only", action.value, file)
-                    processed_files.add(file)
-                    continue
+            # One paused() block for every file, so the processor renumbers its groups once, not once per file
+            with self.processor.paused():
+                for file in to_process:
+                    if file.is_zip and action != FileAction.IGNORE:
+                        # set_file_state never allows this, but acting on file.path_obj would delete or move the WHOLE
+                        #   zip
+                        logger.warning("Refusing to %s %s, files in zips are read-only", action.value, file)
+                        processed_files.add(file)
+                        continue
 
-                if file not in self.processor._reverse_hashes and action != FileAction.IGNORE:
-                    # Its folder was removed from the scan after it was marked, so leave the file alone
-                    logger.info("Skipping %s, it is no longer part of the scan", file)
-                    skipped_files.append(file)
-                    processed_files.add(file)
-                    continue
+                    if file not in self.processor._reverse_hashes and action != FileAction.IGNORE:
+                        # Its folder was removed from the scan after it was marked, so leave the file alone
+                        logger.info("Skipping %s, it is no longer part of the scan", file)
+                        skipped_files.append(file)
+                        processed_files.add(file)
+                        continue
 
-                try:
-                    if action == FileAction.DELETE:
-                        try:
-                            file_size_deleted += self.delete_file(file.path_obj)
-                            file_count_deleted += 1
-                        except FileNotFoundError:
-                            logger.info("File already deleted: %s", file)
-
-                        self.processor.remove(file)
-                    elif action == FileAction.IGNORE:
-                        self.processor.ignore(file)
-                        file_count_ignored += 1
-                    else:  # FileAction.MOVE
-                        destination = self.move_file(file.path_obj, folder)
-                        file_count_renamed += destination.name != file.path_obj.name
-
-                        if any(_is_under(f, destination) for f in self.file_paths_selected()):
-                            self.processor.rename(file, ZipPath(str(destination)))
-                        else:
-                            # This file is no longer in a selected folder! So remove it from the matching
+                    try:
+                        if action == FileAction.DELETE:
+                            try:
+                                file_size_deleted += self.delete_file(file.path_obj)
+                                file_count_deleted += 1
+                            except FileNotFoundError:
+                                logger.info("File already deleted: %s", file)
                             self.processor.remove(file)
-                        file_count_moved += 1
-                except OSError as e:
-                    # e.g. the file is open in another program. Leave it marked so it can be tried again
-                    logger.warning("Failed to %s %s: %s", action.value, file, e)
-                    failed_files.append(file)
-                else:
-                    processed_files.add(file)
+                            self.image_view_area.forget(file)
+                        elif action == FileAction.IGNORE:
+                            self.processor.ignore(file)
+                            file_count_ignored += 1
+                        else:  # FileAction.MOVE
+                            destination = self.move_file(file.path_obj, folder)
+                            file_count_renamed += destination.name != file.path_obj.name
+                            # The file isn't at its old path anymore (moves never replace a file, see move_file)
+                            self.image_view_area.forget(file)
+
+                            if any(_is_under(f, destination) for f in self.file_paths_selected()):
+                                self.processor.rename(file, ZipPath(str(destination)))
+                            else:
+                                # This file is no longer in a selected folder! So remove it from the matching
+                                self.processor.remove(file)
+                            file_count_moved += 1
+                    except OSError as e:
+                        # e.g. the file is open in another program. Leave it marked so it can be tried again
+                        logger.warning("Failed to %s %s: %s", action.value, file, e)
+                        failed_files.append(file)
+                    else:
+                        processed_files.add(file)
         finally:
             # Clear the states which we have processed
             self.file_states = {k: v for k, v in self.file_states.items() if k not in processed_files}
@@ -1498,9 +1614,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 event.ignore()
                 return
 
-            if not self.processor.is_finished():
-                # Stop, not finish: a paused scan has to wake up to stop, or closing would wait on it forever
-                self.processor.stop()
+            # Stop the scan (even a paused one), and wait for its thread to stop. Otherwise the thread pool would wait
+            #   for that thread as Python shuts down, and by then the thread can't run to finish, so the app would hang
+            self.processor.finish()
+            self._threadpool.waitForDone()
 
         event.accept()
 

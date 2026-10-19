@@ -3,16 +3,17 @@ import logging
 import os
 import time
 
+from bisect import bisect_left, insort
 from collections import defaultdict, deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from functools import wraps
+from functools import partial, wraps
 from itertools import combinations
 from multiprocessing import Pool
-from os import cpu_count
 from pathlib import Path
 from queue import Queue
-from threading import Event, Semaphore
-from typing import ClassVar
+from threading import Event, RLock, Semaphore
+from typing import Callable, ClassVar, Iterable, Sequence
 from zipfile import BadZipFile, ZipFile
 
 import numpy as np
@@ -20,8 +21,6 @@ import numpy as np
 from PIL import Image, ImageFile, UnidentifiedImageError
 
 from pixmatch import phash
-
-ImageFile.LOAD_TRUNCATED_IMAGES = True  # Allow damaged images
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +40,14 @@ class ZipPath:
     #   When I tried that last it introduced problems with inter-process communication
     path: str
     subpath: str = ''
+
+    def __str__(self) -> str:
+        """Show a file in a zip as if the zip were a folder, like Windows Explorer does"""
+        if not self.subpath:
+            return self.path
+
+        # Zips separate folders with "/" on every OS
+        return self.path + os.sep + self.subpath.replace('/', os.sep)
 
     @property
     def path_obj(self) -> Path:
@@ -65,7 +72,7 @@ class ZipPath:
 
 
 def _is_under(folder_abs: str, target: str | Path) -> bool:
-    """Return True if the ZipPath's real file (zp.path) is inside folder_abs."""
+    """Is target (a file or folder) inside the folder folder_abs, or that folder itself? Links in both are followed"""
     try:
         Path(target).expanduser().resolve().relative_to(Path(folder_abs).expanduser().resolve())
     except ValueError:
@@ -85,14 +92,42 @@ STRENGTH_RADIUS = (8, 8, 8, 6, 6, 4, 4, 2, 2, 0, 0)
 #   when matches can differ by at least this many bits, but loses matches at stricter strengths.
 DRAFT_RADIUS = 4
 
+# The most files handed to the pool at once for each of its processes, counting the ones whose results are waiting to be
+#   added. That's plenty to keep every process busy. The walk finds files far faster than they can be hashed, and
+#   handing each one over as soon as it was found took ~2.8KB per file until it was hashed (~2.7GB for a million).
+#   The files waiting their turn are kept as just their paths instead, which took ~250 bytes per file
+TASKS_PER_PROCESS = 8
 
-def calculate_hashes(f, *, is_gif=False, exact_match=False, draft=False) -> tuple[int | str, set[int], bytes | None]:
+# The environment variable for how many threads OpenBLAS uses, the math library in numpy's builds for Windows and Linux.
+#   It starts one per CPU as numpy is imported, and sets memory aside for each: importing numpy took ~390MB with 12 CPUs
+#   (most of it never touched, but all of it counted against what Windows can hand out), and 16MB with this set to 1.
+#   Hashing has no use for those threads: the largest product it takes is of 32x32 arrays. See _one_blas_thread
+BLAS_THREADS_VAR = "OPENBLAS_NUM_THREADS"
+
+# Formats whose extra frames are an animation. Other formats can have more than one frame too, but their first frame is
+#   the image: like a TIFF's other pages, or the preview that many cameras add to their JPEGs (which open as MPO)
+ANIMATION_FORMATS = {"GIF", "PNG", "WEBP"}
+
+
+def _is_animation(im: Image.Image) -> bool:
+    """Is this image an animation? This goes by what's in the file, not its extension"""
+    if im.format not in ANIMATION_FORMATS:
+        return False
+
+    try:
+        return im.is_animated
+    except Exception:  # ruff: ignore[blind-except]
+        # Counting a damaged file's frames can fail (e.g. Pillow raises IndexError for a GIF that was cut off in its
+        #   second frame's header), but its first frame can still be hashed, like a still image's
+        return False
+
+
+def calculate_hashes(f, *, exact_match=False, draft=False) -> tuple[int | str, set[int], bytes | None]:
     """
     Calculate hashes for a given file.
 
     Args:
         f (IO or str or Path): Either a file path to process, or a in-memory BytesIO object ready for reading.
-        is_gif (bool): Is this gif data? Needed if passing an in-memory BytesIO object.
         exact_match (bool): Use exact SHA256 hahes?
             If true, strength must be 10.
             If false, perceptual hashes will be used, even with high strength.
@@ -114,6 +149,7 @@ def calculate_hashes(f, *, is_gif=False, exact_match=False, draft=False) -> tupl
         return hasher.hexdigest(), set(), None
 
     with Image.open(f) as im:
+        animated = _is_animation(im)
         if draft:
             # JPEGs can be decoded at 1/2 to 1/8 of their size (and straight to grayscale), which is several times
             #   faster than decoding all of a large photo just to shrink it. This does nothing for other formats.
@@ -122,7 +158,7 @@ def calculate_hashes(f, *, is_gif=False, exact_match=False, draft=False) -> tupl
         orientation = im.getexif().get(phash.EXIF_ORIENTATION_TAG, 1)
         gray = phash.grayscale(im)
         px = phash.resized_pixels(gray, phash.HASH_IMG_SIZE)
-        if is_gif:
+        if animated:
             # Some animations start with a blank frame (nothing, or only a single color). Its hash would be noise
             #   that happens to be shared by other blank frames, so use the first frame that has something in it.
             while phash.is_flat(px):
@@ -148,10 +184,40 @@ def calculate_hashes(f, *, is_gif=False, exact_match=False, draft=False) -> tupl
         return phash.FLAT_HASH, set(), None
 
     # All the rotations and mirrors are made from the one small resized array, which is far cheaper than
-    #   transforming the full size image. For GIFs we'll look for mirrored versions but thats it
-    variants = (px, np.fliplr(px)) if is_gif else tuple(phash.orientations(px))
+    #   transforming the full size image. For animations we'll look for mirrored versions but thats it
+    variants = (px, np.fliplr(px)) if animated else tuple(phash.orientations(px))
     initial_hash, *extras = (phash.phash(variant) for variant in variants)
     return initial_hash, set(extras), phash.centre_hashes(np.ascontiguousarray(centre), width, height)
+
+
+@contextmanager
+def _one_blas_thread():
+    """
+    Have the processes that are started in this block load numpy with a single math thread (see BLAS_THREADS_VAR).
+
+    OpenBLAS reads the variable once, as it's loaded. A process gets its variables from the one that starts it, so the
+        variable is set here for as long as the pool's processes are being started, then put back.
+        numpy is already loaded in this process, so nothing changes for it.
+    """
+    before = os.environ.get(BLAS_THREADS_VAR)
+    os.environ[BLAS_THREADS_VAR] = "1"
+    try:
+        yield
+    finally:
+        if before is None:
+            del os.environ[BLAS_THREADS_VAR]
+        else:
+            os.environ[BLAS_THREADS_VAR] = before
+
+
+def _init_worker(load_truncated_images: bool):  # ruff: ignore[boolean-type-hint-positional-argument]
+    """
+    Set up a process of the pool that hashes images.
+
+    Pillow's settings belong to each process, and the pool's processes don't get the settings of the one that made them
+        (on Windows they start from scratch). So a setting like allowing damaged images is passed on here.
+    """
+    ImageFile.LOAD_TRUNCATED_IMAGES = load_truncated_images
 
 
 def thread_error_handler(func):
@@ -179,8 +245,7 @@ def _process_image(
     """Get the hashes for a given path. Is multiprocessing compatible"""
     path = Path(path)
     if path.suffix.lower() != '.zip':
-        return path, calculate_hashes(path, is_gif=path.suffix.lower() in {".gif", ".webp"},
-                                      exact_match=exact_match, draft=draft)
+        return path, calculate_hashes(path, exact_match=exact_match, draft=draft)
 
     if not supported_extensions:
         supported_extensions = ImageMatcher.SUPPORTED_EXTS
@@ -198,8 +263,7 @@ def _process_image(
 
             try:
                 with zf.open(f) as zipped_file:
-                    results[f.filename] = calculate_hashes(zipped_file, is_gif=f_ext in {".gif", ".webp"},
-                                                           exact_match=exact_match, draft=draft)
+                    results[f.filename] = calculate_hashes(zipped_file, exact_match=exact_match, draft=draft)
             except BadZipFile as e:
                 logger.warning("Could not read %s in %s due to %s", f.filename, path, e)
             except UnidentifiedImageError:
@@ -214,6 +278,8 @@ def _process_image(
 @dataclass
 class ImageMatch:
     """A match data structure containing the matches and where this match lies in the match list"""
+    # Its place in ImageMatcher.matches, or None if it isn't a match: it has no duplicates (yet), or a group filter
+    #   drops it (see ImageMatcher.set_group_filters)
     match_i: int | None = field(default=None)
     matches: list[ZipPath] = field(default_factory=list)
 
@@ -235,6 +301,7 @@ class ImageMatch:
 class NewGroup:
     """A new group event"""
     group: "ImageMatch"
+    seq: int  # The event's number. They're numbered from 1 in the order they're sent, see ImageMatcher.events_sent
 
 
 @dataclass(frozen=True)
@@ -242,6 +309,7 @@ class NewMatch:
     """A new match event"""
     group: "ImageMatch"
     path: ZipPath
+    seq: int  # The event's number, like NewGroup's
 
 
 @dataclass(frozen=True)
@@ -250,6 +318,25 @@ class Finished:
 
 
 MatcherEvent = NewGroup | NewMatch | Finished
+# endregion
+
+
+# region Group filters
+# A group filter is given the images in a group of duplicates, and returns whether to keep the group as a match (True)
+#   or drop it from ImageMatcher.matches (False). See ImageMatcher.set_group_filters
+GroupFilter = Callable[[Sequence[ZipPath]], bool]
+
+
+def has_image_outside_zips(images: Sequence[ZipPath]) -> bool:
+    """
+    A group filter that drops the groups whose images are all in zips.
+
+    Files in zips are read-only, so there's nothing in those groups that can be deleted.
+
+    Returns:
+        bool: Whether any of the images isn't in a zip.
+    """
+    return any(not image.is_zip for image in images)
 # endregion
 
 
@@ -349,20 +436,28 @@ class ImageMatcher:
     """
     An image matching SDK
 
+    Images are hashed in other processes, which use this process's setting for PIL.ImageFile.LOAD_TRUNCATED_IMAGES.
+        So set that to True to hash damaged images too (the app does), rather than skipping them.
+
+    While `run` is running, images are added on another thread. To change the matcher's data or read through it
+        (like `matches`) from any other thread meanwhile, do it in a `with matcher.paused():` block.
+
     Args:
         strength (int): The 0-10 strength to use for matching. Defaults to 5.
             STRENGTH_RADIUS has how many bits two images' hashes can differ by at each strength.
         exact_match (bool): Should use SHA-256 hashes? If False, the default, will use perceptual hashes.
             If True, strength must be 10.
-        processes (int): The number of processes to use. Defaults to None.
+        processes (int): The number of processes to use. Defaults to None, for one per CPU.
         extensions (set): The extensions to process. Optional.
         rotation (bool): Also match copies turned by a few degrees (by their centre hashes)?
             Centre hashes are always calculated, so `regroup` can turn this on or off. Ignored for SHA-256 hashes.
+        group_filters (Iterable[GroupFilter]): Only the groups of duplicates that all of these keep are matches (are in
+            `matches`), see set_group_filters. Defaults to none, so every group of duplicates is a match.
     """
-    SUPPORTED_EXTS: ClassVar = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".bmp", ".gif", ".zip"}
+    SUPPORTED_EXTS: ClassVar = {".jpg", ".jpeg", ".jfif", ".png", ".webp", ".tif", ".tiff", ".bmp", ".gif", ".zip"}
 
     def __init__(self, strength: int = 5, processes: int | None = None, extensions: set | None = None,
-                 *, exact_match: bool = False, rotation: bool = False):
+                 *, exact_match: bool = False, group_filters: Iterable[GroupFilter] = (), rotation: bool = False):
         if not (0 <= strength <= 10):
             raise ValueError("Strength must be between 0 and 10!")
 
@@ -372,18 +467,25 @@ class ImageMatcher:
         self.radius = STRENGTH_RADIUS[strength]
         self.exact_match = exact_match
         self.processes = processes
+        self._group_filters = tuple(group_filters)  # See set_group_filters
 
         self.found_images = 0
         self.processed_images = 0
-        self.duplicate_images = 0
+        self.duplicate_images = 0  # How many images the groups in `matches` have
         self.matches = []
 
         # Both ends of these queues are in this process (the pool runs its callbacks on a thread here, not in the
         #   workers), so they don't need to be multiprocessing queues
         self.events = Queue()  # Events to go to higher level users
+        # The seq of the last NewGroup or NewMatch event sent. Data read in a paused() block has the changes of every
+        #   event up to this one, so a user can tell which events (maybe still queued) it has already seen
+        self.events_sent = 0
         self._new_paths = Queue()  # Inbound queue for new paths that are added while processing is running
         self._removed_paths = set()  # Paths that have been removed from processing after processing has been started
         self._ignored_files = set()  # Files which have been ignored and should be skipped from processing if re-ran
+        # The folders that the scan in progress has walked, so that each one is only walked once however its paths
+        #   overlap: a folder that was added twice, or along with a folder that it's in. See run
+        self._walked = set()
         self._processed_zips = {}  # Zips that have been successfully processed
         self._hashes = defaultdict(ImageMatch)  # Hash -> Paths
         self._reverse_hashes = {}  # Path -> Hash
@@ -411,6 +513,17 @@ class ImageMatcher:
         self._finished = Event()
         self._finished.set()
 
+        # Held while an image is added, and by paused(), so the matcher's data is never changed by two threads at once,
+        #   or changed while another thread reads through it
+        self._lock = RLock()
+        self._paused_depth = 0  # How many paused() blocks are open. Only changed while holding _lock
+        # The match_i of every group taken out of `matches` in the open paused() block, sorted. The groups after them
+        #   are renumbered when the block ends, see remove
+        self._unmatched = []
+
+        # How many more files can be handed to the pool, see TASKS_PER_PROCESS. Each run makes its own for its processes
+        self._free_slots = None
+
     @property
     def left_to_process(self):
         """Files that are left to process"""
@@ -426,24 +539,60 @@ class ImageMatcher:
         """
         Mark a folder to be skipped going forward, and remove already-indexed files
         that live under it. Pauses briefly if not already paused to keep state sane.
+
+        Files under it that a running scan found, but hasn't handed to the pool yet, are skipped (see _send_files).
+            The few that were handed over already are still hashed, and then dropped (see _add_result).
         """
-        # TODO: This works but the biggest problem with it is that it will not remove any images which are still
-        #   queue'd up for processing in the ThreadPool... I'm not sure how to fix that yet.
         folder = str(Path(folder).expanduser().resolve())
-        paused = self.conditional_pause()
-        self._removed_paths.add(folder)
+        with self.paused():
+            self._removed_paths.add(folder)
 
-        # Remove anything we've already seen under that folder
-        # (iterate over a copy because remove() mutates structures)
-        to_remove = [p for p in self._reverse_hashes if _is_under(folder, p.path)]
-        for p in to_remove:
-            self.remove(p)
+            # Remove anything we've already seen under that folder
+            # (iterate over a copy because remove() mutates structures)
+            to_remove = [p for p in self._reverse_hashes if _is_under(folder, p.path)]
+            for p in to_remove:
+                self.remove(p)
 
-        to_remove_zips = [p for p in self._processed_zips if _is_under(folder, p)]
-        for p in to_remove_zips:
-            self._processed_zips.pop(p)
+            to_remove_zips = [p for p in self._processed_zips if _is_under(folder, p)]
+            for p in to_remove_zips:
+                self._processed_zips.pop(p)
 
-        self.conditional_resume(paused)
+            # If the folder is added back during this scan, it has to be walked again. These are compared as text:
+            #   both come from resolved paths (see run), and resolving every walked folder again would take a while.
+            #   The walk adds to the set meanwhile, so it's copied to be read through
+            inside = folder if folder.endswith(os.sep) else folder + os.sep
+            self._walked -= {walked for walked in tuple(self._walked) if walked == folder or walked.startswith(inside)}
+
+    def _is_removed(self, path: str | Path) -> bool:
+        """Is this file or folder in a folder that was removed from processing (see remove_path)?"""
+        # Copied first: another thread can add or remove a folder at any time, and a set that changes while it's being
+        #   iterated raises
+        return any(_is_under(folder, path) for folder in tuple(self._removed_paths))
+
+    @contextmanager
+    def paused(self):
+        """
+        Pause processing while the matcher's data is changed or read through, then resume (if it wasn't paused before).
+
+        Pausing on its own only stops images from being added from then on: one that is being added carries on.
+            So this also waits for that one, and keeps the data from changing until the `with` block ends.
+            Blocks can be nested.
+        Groups that stop being matches (see remove) are taken out of `matches` straight away, but the groups after them
+            are only renumbered once the outermost block ends. So remove many files in one block: renumbering after each
+            one took ~15ms per file with 100k groups after it.
+        """
+        was_paused = self.conditional_pause()
+        try:
+            with self._lock:
+                self._paused_depth += 1
+                try:
+                    yield
+                finally:
+                    self._paused_depth -= 1
+                    if not self._paused_depth:
+                        self._renumber_matches()
+        finally:
+            self.conditional_resume(was_paused)
 
     def conditional_pause(self) -> bool:
         """Pause if not paused and return if was paused"""
@@ -473,6 +622,8 @@ class ImageMatcher:
         """Finish processing"""
         logger.debug('Performing finished')
         self._finished.set()
+        # Wake up anything waiting for a pause to end, so it sees that processing is finished instead of waiting forever
+        self._not_paused.set()
 
     def is_finished(self):
         """Is processing finished"""
@@ -491,34 +642,27 @@ class ImageMatcher:
         """Remove a loaded path completely from the image matching system. Will not delete a file."""
         # Pause things while we remove things...
         logger.info('Removing %s from %s', path, self.__class__.__name__)
-        paused = self.conditional_pause()
+        with self.paused():
+            hash_ = self._reverse_hashes.pop(path)
+            self._image_hashes.pop(path, None)
+            self._remove_path_centres(path)
+            group = self._hashes[hash_]
+            group.matches.remove(path)
+            if group.match_i is not None:
+                self.duplicate_images -= 1
 
-        hash_ = self._reverse_hashes.pop(path)
-        self._image_hashes.pop(path, None)
-        self._remove_path_centres(path)
-        self._hashes[hash_].matches.remove(path)
-        if len(self._hashes[hash_].matches) == 1:
-            match_i = self._hashes[hash_].match_i
-            logger.debug('Unmatching match group %s', match_i)
-            self._hashes[hash_].match_i = None
+            if not group.matches:
+                logger.debug('Removing empty match group')
+                del self._hashes[hash_]
+                if self._index is not None:
+                    self._index.remove(hash_)
 
-            del self.matches[match_i]
-            self.refresh_match_indexes(match_i)
-            self.duplicate_images -= 2
+            else:
+                # With one image left it isn't a match anymore, and the group filters may decide differently now
+                self._update_match(group)
 
-        elif not self._hashes[hash_].matches:
-            logger.debug('Removing empty match group')
-            del self._hashes[hash_]
-            if self._index is not None:
-                self._index.remove(hash_)
-
-        else:
-            logger.debug('Simple removal performed')
-            self.duplicate_images -= 1
-
-        self.processed_images -= 1
-        self.found_images -= 1
-        self.conditional_resume(paused)
+            self.processed_images -= 1
+            self.found_images -= 1
 
     def ignore(self, path):
         """Remove a path from the image matching service"""
@@ -536,8 +680,7 @@ class ImageMatcher:
             return
 
         logger.info('Renaming %s to %s in %s', old_path, new_path, self.__class__.__name__)
-        paused = self.conditional_pause()
-        try:
+        with self.paused():
             if new_path in self._reverse_hashes:
                 # The file that was at new_path has been replaced by this one
                 self.remove(new_path)
@@ -553,13 +696,92 @@ class ImageMatcher:
             # Replace it in place, so the file keeps its position (column) in its group
             matches = self._hashes[hash_].matches
             matches[matches.index(old_path)] = new_path
-        finally:
-            self.conditional_resume(paused)
+            # Where the file is now can change what the group filters decide about its group
+            self._update_match(self._hashes[hash_])
+
+    def set_group_filters(self, group_filters: Iterable[GroupFilter]):
+        """
+        Choose which groups of duplicates are matches (are in `matches`): only the ones that all of these keep.
+
+        A group that a filter drops still gets its images, but it isn't in `matches`, it has no match_i, its images
+            aren't counted in duplicate_images, and no events are sent about it. If an image added to it makes the
+            filters keep it, it becomes a match at the end of `matches` with a NewGroup event, like a new group.
+        A match is checked again when its images are removed or moved, but not as images are added to it: taking it out
+            of `matches` mid-scan would renumber the groups after it while events about them are on their way.
+            So a filter shouldn't drop a group because an image was added to it.
+
+        Changing the filters sends no events, so read `matches` again afterwards. The groups that stay matches keep
+            their order, and the ones that become matches go after them, in the order their first images were found.
+
+        Args:
+            group_filters (Iterable[GroupFilter]): The filters. Each is given a group's images (which it mustn't
+                change) and returns whether to keep the group. They're called as images are added, so make them quick.
+        """
+        with self.paused():
+            self._group_filters = tuple(group_filters)
+
+            # Every group is checked, so `matches` is made again in one go. Taking the groups out one at a time (like
+            #   remove does) moves every group after each one: 0.7s to take out 50k of 100k groups
+            kept = []
+            for group in self.matches:
+                if self._counts_as_match(group):
+                    kept.append(group)
+                else:
+                    group.match_i = None
+                    self.duplicate_images -= len(group.matches)
+
+            # The groups the old filters dropped that these keep (a dict keeps the order its keys were added in)
+            added = [group for group in self._hashes.values() if group.match_i is None and self._counts_as_match(group)]
+            self.duplicate_images += sum(len(group.matches) for group in added)
+            self.matches[:] = kept + added
+
+            # Every group is renumbered here, so the paused() block this is in (if any) has nothing left to renumber
+            self._unmatched.clear()
+            self.refresh_match_indexes()
 
     def refresh_match_indexes(self, start=0):
         """Update the match_i value for all the matches passed a certain point"""
         for match_i, match in enumerate(self.matches[start:], start=start):
             match.match_i = match_i
+
+    def _renumber_matches(self):
+        """Renumber the groups after the first one taken out of `matches` in the paused() block that just ended"""
+        if self._unmatched:
+            # The groups before the first one taken out kept their places, so their numbers are still right
+            self.refresh_match_indexes(self._unmatched[0])
+            self._unmatched.clear()
+
+    def _counts_as_match(self, group: ImageMatch) -> bool:
+        """Should this group be a match (be in `matches`)? It needs duplicates, and every group filter has to keep it"""
+        return len(group.matches) >= 2 and all(keep(group.matches) for keep in self._group_filters)
+
+    def _match(self, group: ImageMatch):
+        """Make a group a match, at the end of `matches`"""
+        # Numbered like the groups before it: in a paused() block, that still counts the groups taken out of `matches`
+        #   until the block ends and renumbers them (see _unmatch)
+        group.match_i = len(self.matches) + len(self._unmatched)
+        self.matches.append(group)
+        self.duplicate_images += len(group.matches)
+
+    def _unmatch(self, group: ImageMatch):
+        """Take a group out of `matches`. Only do this in a paused() block, which renumbers the groups after it"""
+        match_i = group.match_i
+        logger.debug('Unmatching match group %s', match_i)
+        group.match_i = None
+
+        # Groups aren't renumbered until the paused() block ends, so this group's match_i is ahead of its place
+        #   in `matches` by how many groups before it were already taken out in this block
+        del self.matches[match_i - bisect_left(self._unmatched, match_i)]
+        insort(self._unmatched, match_i)
+        self.duplicate_images -= len(group.matches)
+
+    def _update_match(self, group: ImageMatch):
+        """Make a group a match or stop it being one, as _counts_as_match decides, after its images changed"""
+        if self._counts_as_match(group):
+            if group.match_i is None:
+                self._match(group)
+        elif group.match_i is not None:
+            self._unmatch(group)
 
     def _find_group(self, hashes: set, centre: bytes | None = None) -> int | str | None:
         """
@@ -629,13 +851,11 @@ class ImageMatcher:
 
     def _process_image_callback(self, result):
         """
-        Handle the result of hashing an image.
+        Handle the result of hashing an image, and update the found and processed image counts.
 
-        This needs to do quite a few things including sanitizing the results,
-            actually checking if the hash matches an existing image,
-            adding the image and any matches to the backend data structures, notify any listeners,
-            update the found and processed image counts,
-            and verify that this result wasn't added as a removed path since it was queued.
+        This runs on the pool's thread that hands back results. If it raised, that thread would stop, so no more results
+            would be handled and the scan would never finish. So an image that can't be added is logged,
+            and counted like an image that couldn't be hashed.
 
         Args:
             result: A tuple consisting of the path to the file, and the resultant hashes.
@@ -645,29 +865,82 @@ class ImageMatcher:
         # TODO: This callback must return IMMEDIATELY and is currently too slow for large amounts of zips.
         #   Perhaps create a new queue/thread and queue up processing for zip results?
         #   I think the major slow point is adding to the data structures and I'm not sure if more threads will help
-        # Check for paused or finished signals
-        self._not_paused.wait()
-        if self.is_finished():
+        if isinstance(result[1], dict):
+            try:
+                self._add_zip_result(result)
+            except Exception:
+                logger.exception("Could not add the images in %s", result[0])
+                with self._lock:
+                    self.processed_images += 1  # Counted like a zip that couldn't be read
             return
 
+        # Check for paused or finished signals
+        self._not_paused.wait()
+        with self._lock:  # Whatever paused to change or read the data (see paused) holds this until it's done
+            if self.is_finished():
+                return
+
+            try:
+                processed = self._add_result(result)
+            except Exception:
+                logger.exception("Could not add %s", result[0])
+                processed = True
+
+            if processed:
+                self.processed_images += 1
+            else:
+                self.found_images -= 1
+
+    def _add_zip_result(self, result):
+        """
+        Add the images that were hashed in a zip, by passing each one to _process_image_callback on its own.
+
+        That waits for any pause to end before each image, so the lock is only held for one image at a time.
+            Holding it for the whole zip would leave whatever paused waiting for the lock, while this waits for the
+            pause to end.
+        The zip stays counted as a file left to process until all of its images are added and counted,
+            so the scan can't finish partway through it.
+        """
+        path, hashes = result
+        with self._lock:
+            if self.is_finished():
+                return
+
+            if self._is_removed(path):
+                # This zip was removed AFTER it was queue'd! So just leave...
+                self.found_images -= 1
+                return
+
+        subpaths = []
+        for sub_path, sub_hashes in hashes.items():
+            with self._lock:
+                self.found_images += 1
+            subpaths.append(ZipPath(str(path), sub_path))
+            self._process_image_callback((subpaths[-1], sub_hashes))
+
+        with self._lock:
+            self._processed_zips[str(path)] = subpaths
+            self.found_images -= 1
+
+    def _add_result(self, result) -> bool:
+        """
+        Add the result of hashing an image (not a zip) to the matching. The lock must be held.
+
+        This needs to do quite a few things including sanitizing the results,
+            actually checking if the hash matches an existing image,
+            adding the image and any matches to the backend data structures, notify any listeners,
+            and verify that this result wasn't added as a removed path since it was queued.
+
+        Returns:
+            bool: Whether the image was processed. False if it was skipped, so it isn't part of the scan after all.
+        """
         # region Sanitize results
         path: Path | str | ZipPath
         path, hashes = result
 
-        if any(_is_under(d, path.path if isinstance(path, ZipPath) else path) for d in self._removed_paths):
-            # This image was removed AFTER it was queue'd! So decrement the found images count and just leave...
-            self.found_images -= 1
-            return
-
-        if isinstance(hashes, dict):
-            self.found_images -= 1
-            subpaths = []
-            for sub_path, sub_hashes in hashes.items():
-                self.found_images += 1
-                subpaths.append(ZipPath(str(path), sub_path))
-                self._process_image_callback((subpaths[-1], sub_hashes))
-            self._processed_zips[str(path)] = subpaths
-            return
+        if self._is_removed(path.path if isinstance(path, ZipPath) else path):
+            # This image was removed AFTER it was queue'd! So just leave...
+            return False
 
         initial_hash, extra_hashes, centre = hashes
         extra_hashes.add(initial_hash)
@@ -677,18 +950,17 @@ class ImageMatcher:
         # endregion
 
         if path in self._reverse_hashes:
-            self.found_images -= 1
-            return
+            return False
 
-        self.processed_images += 1
         self._image_hashes[path] = (self._next_order, (initial_hash, *(extra_hashes - {initial_hash})), centre)
         self._next_order += 1
         self._add_image(path, initial_hash, extra_hashes, centre)
+        return True
 
     def _add_image(self, path: ZipPath, initial_hash: int | str, hashes: set, centre: bytes | None = None, *,
                    emit: bool = True):
         """
-        Put an image in the group it matches, or in a group of its own if it matches none.
+        Put an image in the group it matches, or in a group of its own if it matches none. The lock must be held.
 
         Args:
             path (ZipPath): The image.
@@ -711,35 +983,35 @@ class ImageMatcher:
             return
 
         # We have found a match!
+        group = self._hashes[hash_]
         self._reverse_hashes[path] = hash_
-        self._hashes[hash_].matches.append(path)
+        group.matches.append(path)
         if self.rotation and centre is not None:
             self._add_path_centres(path, phash.unpack_centre_hashes(centre)[0])
 
-        if self._hashes[hash_].match_i is None and len(self._hashes[hash_].matches) >= 2:
-            # This is a brand new match group!
-            self._hashes[hash_].match_i = len(self.matches)
-            self.matches.append(self._hashes[hash_])
-            self.duplicate_images += 2
-            if emit:
-                self.events.put(NewGroup(self._hashes[hash_].snapshot()))
-                logger.debug('New match group found: %s', self._hashes[hash_].matches)
-        else:
+        if group.match_i is not None:
             # Just another match for an existing group...
             self.duplicate_images += 1
             if emit:
-                self.events.put(NewMatch(self._hashes[hash_].snapshot(), path))
-                logger.debug('New match found for group #%s: %s',
-                             self._hashes[hash_].match_i,
-                             self._hashes[hash_].matches)
+                self.events_sent += 1
+                self.events.put(NewMatch(group.snapshot(), path, self.events_sent))
+                logger.debug('New match found for group #%s: %s', group.match_i, group.matches)
+        elif self._counts_as_match(group):
+            # This is a brand new match group! (Or one that the group filters dropped until this image was added)
+            self._match(group)
+            if emit:
+                self.events_sent += 1
+                self.events.put(NewGroup(group.snapshot(), self.events_sent))
+                logger.debug('New match group found: %s', group.matches)
 
     def regroup(self, strength: int, *, rotation: bool | None = None):
         """
         Group the loaded images again at another strength (or with rotation on or off), without hashing them again.
 
-        Images are matched in the same order they were the first time, with the same logic, so the groups are what
-            matching at this strength would have made from the same hashes.
+        Images are matched in the same order they were the first time, with the same logic (and group filters), so the
+            groups are what matching at this strength would have made from the same hashes.
         Processing must be finished (or stopped) first, since this rebuilds everything the callbacks write to.
+            It sends no events, so read `matches` again afterwards.
 
         Args:
             strength (int): The 0-10 strength to group at.
@@ -759,90 +1031,123 @@ class ImageMatcher:
         if not self.is_finished():
             raise RuntimeError("Can't regroup while processing is running")
 
-        self.strength = strength
-        self.radius = STRENGTH_RADIUS[strength]
-        if rotation is not None:
-            self.rotation = rotation
-        self.matches = []
-        self.duplicate_images = 0
-        self._hashes = defaultdict(ImageMatch)
-        self._reverse_hashes = {}
-        self._index = HammingIndex(self.radius) if self.radius else None
-        self._centre_index = CentreIndex(CENTRE_RADIUS)
-        self._centre_paths = {}
-        self._path_centres = {}
+        with self._lock:
+            self.strength = strength
+            self.radius = STRENGTH_RADIUS[strength]
+            if rotation is not None:
+                self.rotation = rotation
+            self.matches.clear()
+            self._unmatched.clear()
+            self.duplicate_images = 0
+            self._hashes = defaultdict(ImageMatch)
+            self._reverse_hashes = {}
+            self._index = HammingIndex(self.radius) if self.radius else None
+            self._centre_index = CentreIndex(CENTRE_RADIUS)
+            self._centre_paths = {}
+            self._path_centres = {}
 
-        for path, (_, hashes, centre) in sorted(self._image_hashes.items(), key=lambda item: item[1][0]):
-            self._add_image(path, hashes[0], set(hashes), centre, emit=False)
+            for path, (_, hashes, centre) in sorted(self._image_hashes.items(), key=lambda item: item[1][0]):
+                self._add_image(path, hashes[0], set(hashes), centre, emit=False)
 
     def _process_image_error_callback(self, e):
-        """Temporary for testing"""
-        self.processed_images += 1
-        logger.error("%s: %s (input path %s)", type(e).__name__, e, e.input_path)
+        """Log an image that couldn't be hashed, and count it as processed"""
+        with self._lock:
+            self.processed_images += 1
+        # Errors from _process_image say which file they were for, but errors from the pool itself (like a result that
+        #   couldn't be sent back) don't. And like _process_image_callback, this must not raise
+        logger.error("%s: %s (input path %s)", type(e).__name__, e, getattr(e, "input_path", "unknown"))
 
-    def _task_done(self, result):
-        """A worker finished hashing a file, so handle it and free its slot"""
+    def _on_task_done(self, result):
+        """The pool's callback for a file it hashed: add the result, then make room for another file"""
         try:
             self._process_image_callback(result)
         finally:
-            self._task_slots.release()
+            self._free_slots.release()
 
-    def _task_failed(self, e):
-        """A worker failed to hash a file, so log it and free its slot"""
+    def _on_task_error(self, e):
+        """The pool's callback for a file it couldn't hash: log it, then make room for another file"""
         try:
             self._process_image_error_callback(e)
         finally:
-            self._task_slots.release()
+            self._free_slots.release()
 
-    def _root_stream(self):
-        """This is to yield any paths for processing, then wait until processing is finished for any new paths"""
-        while not self._new_paths.empty() or self.left_to_process:
-            if self.is_finished():
-                return
+    def _root_stream(self, wait):
+        """
+        This is to yield any paths for processing, then wait until processing is finished for any new paths.
 
+        Args:
+            wait (Callable[[], None]): Waits a little (~50ms), for when there are no new paths.
+
+        Yields:
+            str: The paths to process.
+        """
+        # Once finished, images that are still being hashed are dropped rather than counted, so don't wait for them
+        while not self.is_finished() and (not self._new_paths.empty() or self.left_to_process):
             if self._new_paths.empty():
-                time.sleep(0.05)
+                wait()
                 continue
 
             yield self._new_paths.get_nowait()
+
+    def _send_files(self, tp, unsent: deque, *, wait: float = 0):
+        """
+        Hand files the walk found to the pool to hash, while it has room for them (see TASKS_PER_PROCESS).
+
+        Files in a folder that was removed from processing since they were found are skipped (see remove_path).
+
+        Args:
+            tp (multiprocessing.pool.Pool): The pool.
+            unsent (deque[str]): The paths of the files waiting to be handed over, oldest first.
+            wait (float): How long to wait for room, in seconds, if there isn't any. With no files waiting,
+                this just waits that long.
+        """
+        if not unsent:
+            time.sleep(wait)
+            return
+
+        while unsent and not self.is_finished():
+            # Only wait for room for the first file
+            if not (self._free_slots.acquire(timeout=wait) if wait else self._free_slots.acquire(blocking=False)):
+                return
+            wait = 0
+
+            path = unsent.popleft()
+            if self._is_removed(path):
+                self._free_slots.release()
+                with self._lock:  # The result thread changes this count too
+                    self.found_images -= 1
+                continue
+
+            tp.apply_async(
+                _process_image,
+                args=(path, ),
+                kwds={
+                    'supported_extensions': self.extensions,
+                    'exact_match': self.exact_match,
+                    'draft': self.radius >= DRAFT_RADIUS,
+                },
+                callback=self._on_task_done,
+                error_callback=self._on_task_error,
+            )
 
     def run(self, paths: list[str | Path]):
         """Do the work of matching!"""
         self._not_paused.set()
         self._finished.clear()
+        self._walked = set()
 
         for path in paths:
             self.add_path(path)
 
-        # Only a few files per worker are handed to the pool at a time, and the rest wait in `pending`.
-        #   Stopping then only has to wait for those few, and can close the pool normally: terminating it while
-        #   workers are sending results can fail (on Windows, "concurrent send_bytes() calls"), which would
-        #   leave processing never finishing.
-        self._task_slots = Semaphore((self.processes or cpu_count() or 1) * 4)
-        pending = deque()
-
-        def submit(*, wait: bool):
-            """Hand pending files to the pool while there are free slots, or until all are handed over if wait"""
-            while pending and not self.is_finished():
-                if not self._task_slots.acquire(timeout=0.1 if wait else 0):
-                    if wait:
-                        continue
-                    return
-
-                tp.apply_async(
-                    _process_image,
-                    args=(pending.popleft(), ),
-                    kwds={
-                        'supported_extensions': self.extensions,
-                        'exact_match': self.exact_match,
-                        'draft': self.radius >= DRAFT_RADIUS,
-                    },
-                    callback=self._task_done,
-                    error_callback=self._task_failed,
-                )
-
-        with Pool(self.processes) as tp:
-            for path in self._root_stream():
+        processes = self.processes or os.cpu_count() or 1
+        self._free_slots = Semaphore(processes * TASKS_PER_PROCESS)
+        unsent = deque()  # The files found that are waiting to be handed to the pool, see _send_files
+        with _one_blas_thread():  # The pool starts its processes as it's made
+            pool = Pool(processes,
+                        initializer=_init_worker, initargs=(ImageFile.LOAD_TRUNCATED_IMAGES, ))
+        with pool as tp:
+            # Waiting for results is when the files that were waiting for room in the pool are handed over
+            for path in self._root_stream(partial(self._send_files, tp, unsent, wait=0.05)):
                 path = Path(path)
                 if not path.is_dir():
                     logger.warning('A path was entered that was not a directory : %s', path)
@@ -856,11 +1161,20 @@ class ImageMatcher:
                     if self.is_finished():
                         break
 
-                    dirs.sort()  # This actually works to ensure that os.walk goes in alphabetical order!
-                    root = Path(root)
-
-                    if any(_is_under(d, root) for d in self._removed_paths):
+                    if root in self._walked:
+                        # This scan has walked this folder already, and so every folder in it: it was added twice, or
+                        #   a folder that it's in was added too. Walking it again would hash the files of it that
+                        #   aren't loaded yet a second time
+                        dirs.clear()
                         continue
+
+                    dirs.sort()  # This actually works to ensure that os.walk goes in alphabetical order!
+
+                    if self._is_removed(root):
+                        continue
+
+                    self._walked.add(root)
+                    root = Path(root)
 
                     for f in files:
                         self._not_paused.wait()
@@ -872,9 +1186,6 @@ class ImageMatcher:
                         if f.suffix.lower() not in self.extensions:
                             continue
 
-                        if any(_is_under(d, f) for d in self._removed_paths):
-                            continue
-
                         if str(f) in self._ignored_files:
                             continue
 
@@ -884,26 +1195,27 @@ class ImageMatcher:
                         elif ZipPath(str(f), "") in self._reverse_hashes:
                             continue
 
-                        self.found_images += 1
-                        pending.append(f)
-                        submit(wait=False)
+                        with self._lock:  # The result thread changes this count too
+                            self.found_images += 1
+                        # If its folder is removed from processing, it's skipped when it's handed over
+                        unsent.append(str(f))
+                        self._send_files(tp, unsent)
 
-                # Everything under this path is found, so hand the rest over before waiting for it to finish
-                submit(wait=True)
-
-            # If processing was stopped, the files still pending were never hashed. The few the pool has are
-            #   finished first (their results are thrown away), so the pool can be closed instead of terminated.
-            pending.clear()
+            # If processing was stopped, the files still waiting their turn were never hashed. The few the pool has are
+            #   finished first (their results are thrown away), so the pool can be closed instead of terminated:
+            #   terminating it while workers are sending results can fail (on Windows, "concurrent send_bytes() calls"),
+            #   which would leave processing never finishing
+            unsent.clear()
             tp.close()
             tp.join()
 
         # Forget about files that were found but not hashed, so the counts are right and the next run finds them again
-        self.found_images = self.processed_images
+        with self._lock:
+            self.found_images = self.processed_images
         self._finished.set()
         self.events.put(Finished())
 
     def stop(self):
         """Stop processing. The images hashed so far are kept, and running again picks up the rest"""
         logger.debug('Performing stop')
-        self._finished.set()
-        self._not_paused.set()  # Anything waiting out a pause has to wake up to see that it should stop
+        self.finish()

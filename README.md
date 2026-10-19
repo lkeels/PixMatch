@@ -12,7 +12,7 @@ PixMatch scans folders (and ZIP archives) for visually similar images, groups ma
     —never deleted—so you can safely compare against archived libraries.
 
 
-Supported extensions: `.jpg`, `.jpeg`, `.png`, `.webp`, `.tif`, `.tiff`, `.bmp`, `.gif`, `.zip`.
+Supported extensions: `.jpg`, `.jpeg`, `.jfif`, `.png`, `.webp`, `.tif`, `.tiff`, `.bmp`, `.gif`, `.zip`.
 
 
 ## Install
@@ -60,6 +60,8 @@ Animated image status bar example:
 #### Notes
  * An exact match checkbox is provided. If strength is 10 and this checkbox is checked, 
     SHA-256 file hashes will be used instead of perceptual hashes.
+ * Options > Hide groups only in zips hides the groups whose images are all in zips,
+    since nothing in them can be deleted. It can be turned on and off at any time, even during a scan.
 
 #### Optional Args:
 ```markdown
