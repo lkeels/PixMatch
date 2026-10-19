@@ -187,6 +187,44 @@ class MainWindow(QtWidgets.QMainWindow):
             self.selected_file_path_display.setCurrentRow(0)
 
         self.setWindowIcon(QtGui.QIcon(QtGui.QPixmap(ICON_PATH)))
+        self.restore_position()
+
+    def restore_position(self):
+        """
+        Put the window where it was when it was last closed, or in the middle of the screen the first time.
+
+        If that would leave its title bar off every screen (say a monitor was unplugged, or Windows placed it off
+            screen), it goes in the middle of the screen instead, so it can always be seen and moved.
+        """
+        geometry = self._settings.value("window/geometry")
+        if geometry is not None and self.restoreGeometry(geometry) and self._title_bar_on_screen():
+            return
+
+        self.center_on_screen()
+
+    def _title_bar_on_screen(self) -> bool:
+        """Is enough of the window's top edge on a screen to grab it and move the window?"""
+        frame = self.frameGeometry()
+        top_edge = QtCore.QRect(frame.left(), frame.top(), frame.width(), 30)
+        for screen in QtGui.QGuiApplication.screens():
+            overlap = screen.availableGeometry().intersected(top_edge)
+            if overlap.width() >= 100 and overlap.height() >= 20:
+                return True
+
+        return False
+
+    def center_on_screen(self):
+        """
+        Move the window to the middle of its screen, shrinking it first if it's bigger than the screen.
+
+        It can't shrink past the size its contents need, so on a screen smaller than that its top left corner is kept
+            on the screen, where its title bar can be grabbed.
+        """
+        available = (self.screen() or QtGui.QGuiApplication.primaryScreen()).availableGeometry()
+        self.resize(self.size().boundedTo(available.size() * 0.95))
+        frame = self.frameGeometry()
+        frame.moveCenter(available.center())
+        self.move(max(frame.left(), available.left()), max(frame.top(), available.top()))
 
     def build_extra(self):
         """Extra items not involved with the main display"""
@@ -1627,6 +1665,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.processor.finish()
             self._threadpool.waitForDone()
 
+        # Opened here next time, see restore_position
+        self._settings.setValue("window/geometry", self.saveGeometry())
         event.accept()
 
     def confirm_close(self) -> bool:
