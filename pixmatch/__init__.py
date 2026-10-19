@@ -88,6 +88,9 @@ def _is_under(folder_abs: str, target: str | Path) -> bool:
 #   Past 8 bits, HammingIndex gets much slower (~16ms per image with a million or more images loaded).
 STRENGTH_RADIUS = (8, 8, 8, 6, 6, 4, 4, 2, 2, 0, 0)
 
+# How often regroup reports its progress (and can be cancelled), in images
+REGROUP_PROGRESS_EVERY = 1000
+
 # Decoding JPEGs at a reduced size (see calculate_hashes' draft) can move a hash by up to 2 bits. That is harmless
 #   when matches can differ by at least this many bits, but loses matches at stricter strengths.
 DRAFT_RADIUS = 4
@@ -1017,7 +1020,8 @@ class ImageMatcher:
                 self.events.put(NewGroup(group.snapshot(), self.events_sent))
                 logger.debug('New match group found: %s', group.matches)
 
-    def regroup(self, strength: int, *, rotation: bool | None = None):
+    def regroup(self, strength: int, *, rotation: bool | None = None,
+                progress: Callable[[int, int], bool] | None = None) -> bool:
         """
         Group the loaded images again at another strength (or with rotation on or off), without hashing them again.
 
@@ -1029,6 +1033,12 @@ class ImageMatcher:
         Args:
             strength (int): The 0-10 strength to group at.
             rotation (bool | None): Match copies turned by a few degrees? None leaves it as it is.
+            progress (Callable[[int, int], bool] | None): Called with how many images are regrouped so far, and how
+                many there are, every REGROUP_PROGRESS_EVERY images and at the end. Return False to cancel: the groups,
+                strength and rotation are then put back to what they were.
+
+        Returns:
+            bool: True if it regrouped, False if it was cancelled.
 
         Raises:
             ValueError: The strength is out of range, or the images have SHA-256 hashes, which only match identical
@@ -1045,6 +1055,12 @@ class ImageMatcher:
             raise RuntimeError("Can't regroup while processing is running")
 
         with self._lock:
+            # Everything this replaces, to put back if it's cancelled. The old groups themselves aren't changed:
+            #   the new ones are new ImageMatch objects
+            before = (self.strength, self.radius, self.rotation, list(self.matches), self.duplicate_images,
+                      self._hashes, self._reverse_hashes, self._index, self._centre_index, self._centre_paths,
+                      self._path_centres)
+
             self.strength = strength
             self.radius = STRENGTH_RADIUS[strength]
             if rotation is not None:
@@ -1059,8 +1075,20 @@ class ImageMatcher:
             self._centre_paths = {}
             self._path_centres = {}
 
-            for path, (_, hashes, centre) in sorted(self._image_hashes.items(), key=lambda item: item[1][0]):
+            images = sorted(self._image_hashes.items(), key=lambda item: item[1][0])
+            for done, (path, (_, hashes, centre)) in enumerate(images, start=1):
                 self._add_image(path, hashes[0], set(hashes), centre, emit=False)
+                if progress and done % REGROUP_PROGRESS_EVERY == 0 and not progress(done, len(images)):
+                    (self.strength, self.radius, self.rotation, matches, self.duplicate_images, self._hashes,
+                     self._reverse_hashes, self._index, self._centre_index, self._centre_paths,
+                     self._path_centres) = before
+                    self.matches[:] = matches
+                    return False
+
+            if progress:
+                progress(len(images), len(images))
+
+        return True
 
     def _process_image_error_callback(self, e):
         """Log an image that couldn't be hashed, and count it as processed"""

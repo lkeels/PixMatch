@@ -121,9 +121,18 @@ class ProcessorThread(QtCore.QRunnable):
 
 
 class RegroupSignals(QtCore.QObject):
-    """Signals from a running regroup, with how many seconds it took"""
+    """
+    Signals from a running regroup.
 
+    progress(done, total): How many images are regrouped so far, of how many.
+    done(seconds): It finished, in this many seconds.
+    cancelled(): It was cancelled, and the groups are back to what they were.
+    failed(error): It failed.
+    """
+
+    progress = QtCore.Signal(int, int)
     done = QtCore.Signal(float)
+    cancelled = QtCore.Signal()
     failed = QtCore.Signal(str)
 
 
@@ -136,17 +145,30 @@ class RegroupThread(QtCore.QRunnable):
         self.strength = strength
         self.rotation = rotation
         self.signals = RegroupSignals()
+        self.cancel_requested = False  # Set from the GUI thread to cancel, see cancel
+
+    def cancel(self):
+        """Stop the regroup at its next progress report, and put the groups back to what they were"""
+        self.cancel_requested = True
+
+    def _on_progress(self, done: int, total: int) -> bool:
+        """Report how far it is, and say whether to carry on"""
+        self.signals.progress.emit(done, total)
+        return not self.cancel_requested
 
     def run(self):
         """Do the regroup"""
         start = time.perf_counter()
         try:
-            self.processor.regroup(self.strength, rotation=self.rotation)
+            finished = self.processor.regroup(self.strength, rotation=self.rotation, progress=self._on_progress)
         except Exception as e:
             logger.exception("Regrouping at strength %s failed", self.strength)
             self.signals.failed.emit(f"{type(e).__name__}: {e}")
         else:
-            self.signals.done.emit(time.perf_counter() - start)
+            if finished:
+                self.signals.done.emit(time.perf_counter() - start)
+            else:
+                self.signals.cancelled.emit()
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -711,16 +733,55 @@ class MainWindow(QtWidgets.QMainWindow):
         self.menuBar().setEnabled(False)
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
 
+        self._regroup_message = f"Regrouping at strength {strength}{' with rotation' if rotation else ''}"
+        self._progress_bar.setRange(0, 0)  # Busy, until the first progress report says how many images there are
+        self._cancel_regroup_btn.setText("Cancel")
+        self._cancel_regroup_btn.setEnabled(True)
+        self._cancel_regroup_btn.show()
+
         regroup = RegroupThread(self.processor, strength, rotation=rotation)
+        regroup.signals.progress.connect(self.on_regroup_progress)
         regroup.signals.done.connect(self.on_regroup_done)
+        regroup.signals.cancelled.connect(self.on_regroup_cancelled)
         regroup.signals.failed.connect(self.on_regroup_failed)
         self._regroup_thread = regroup  # The signals must outlive run() until they're delivered
         self._threadpool.start(regroup)
+
+    def on_regroup_progress(self, done: int, total: int):
+        """Show how far the regroup has got"""
+        self._progress_bar.setRange(0, total)
+        self._progress_bar.setValue(done)
+        self.statusBar().showMessage(f"{self._regroup_message}... {done:,} of {total:,} images")
+
+    def cancel_regroup(self):
+        """The Cancel button was pressed during a regroup"""
+        if self._regroup_thread is not None:
+            self._regroup_thread.cancel()
+            self._cancel_regroup_btn.setText("Cancelling...")
+            self._cancel_regroup_btn.setEnabled(False)
+
+    def on_regroup_cancelled(self):
+        """The regroup was cancelled, so the groups are as they were: put the controls back to match them"""
+        self._end_regroup()
+        # Setting them back mustn't start another regroup
+        with QtCore.QSignalBlocker(self.precision_slider), QtCore.QSignalBlocker(self.rotation_chkbx):
+            self.precision_slider.setValue(self.processor.strength)
+            self.rotation_chkbx.setChecked(self.processor.rotation)
+
+        # The Hash match checkbox goes with the strength (see on_precision_adjust)
+        self.hash_match_chkbx.setEnabled(self.processor.strength == 10)
+        self.update_labels()
+        self.statusBar().showMessage(
+            f"Regroup cancelled, still grouped at strength {self.processor.strength}"
+            f"{' with rotation' if self.processor.rotation else ''}.",
+        )
 
     def _end_regroup(self):
         """Give the GUI back after a regroup"""
         self._regrouping = False
         self._regroup_thread = None
+        self._cancel_regroup_btn.hide()
+        self._progress_bar.setRange(0, 100)
         QtWidgets.QApplication.restoreOverrideCursor()
         self.centralWidget().setEnabled(True)
         self.menuBar().setEnabled(True)
@@ -1490,6 +1551,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setStatusBar(sb)
         self.count_label = QtWidgets.QLabel("No groups loaded")
         sb.addPermanentWidget(self.count_label)
+
+        # Only shown while regrouping. The status bar stays usable then, when the rest of the window isn't
+        self._cancel_regroup_btn = QtWidgets.QPushButton("Cancel")
+        self._cancel_regroup_btn.clicked.connect(self.cancel_regroup)
+        self._cancel_regroup_btn.hide()
+        sb.addPermanentWidget(self._cancel_regroup_btn)
 
     def delete_file(self, path: Path) -> int:
         """
