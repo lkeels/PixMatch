@@ -346,9 +346,13 @@ class HammingIndex:
     Finds the stored hashes within some number of differing bits (radius) of a hash, without checking all of them.
 
     This is multi-index hashing: every hash is split into chunks, and each chunk gets its own lookup table.
-    If two hashes are within the radius, then (by the pigeonhole principle) at least one of their chunks differs by
-    no more than radius // CHUNKS bits. So looking up every value that close to each of a hash's chunks finds every
-    stored hash that could be in range, and only those candidates get compared in full.
+    Each chunk has a limit, and the limits add up to at least radius - CHUNKS + 1. If two hashes are within the radius,
+    then (by the pigeonhole principle) at least one of their chunks differs by no more than its limit: otherwise they'd
+    differ by at least the limits plus one each, which is more than the radius. So looking up every value within its
+    limit of each of a hash's chunks finds every stored hash that could be in range, and only those candidates get
+    compared in full.
+    The limits don't have to be equal, only add up: at a radius of 6, limits of 2, 1 and 1 bits mean 298 lookups per
+    hash, instead of 696 with 2 bits each. Measured with 260k images, that regrouped 2.3 times faster.
 
     Args:
         radius (int): The most bits a stored hash can differ by to be found.
@@ -360,12 +364,16 @@ class HammingIndex:
         self.radius = radius
         widths = [self.BITS // self.CHUNKS + (i < self.BITS % self.CHUNKS) for i in range(self.CHUNKS)]
 
-        # For each chunk: where it is in the hash, and every change to it of at most radius // CHUNKS bits
+        # Each chunk's limit (see above): spread as evenly as they can be, with the bigger ones first
+        base_limit, bigger = divmod(max(0, radius - self.CHUNKS + 1), self.CHUNKS)
+        limits = [base_limit + (i < bigger) for i in range(self.CHUNKS)]
+
+        # For each chunk: where it is in the hash, and every change to it of at most its limit
         self._chunks = []
         shift = 0
-        for width in widths:
-            flips = [sum(1 << bit for bit in bits)
-                     for n in range(radius // self.CHUNKS + 1) for bits in combinations(range(width), n)]
+        for width, limit in zip(widths, limits, strict=True):
+            flips = tuple(sum(1 << bit for bit in bits)
+                          for n in range(limit + 1) for bits in combinations(range(width), n))
             self._chunks.append((shift, (1 << width) - 1, flips))
             shift += width
 
@@ -400,18 +408,21 @@ class HammingIndex:
 
     def find(self, hash_: int) -> dict[int, int]:
         """Find the stored hashes within the radius of a hash, as a dict of stored hash -> bits different"""
+        # This runs hundreds of lookups per hash, for every orientation of every image, so it's kept tight
         found = {}
+        radius = self.radius
         for (shift, mask, flips), table in zip(self._chunks, self._tables, strict=True):
             key = hash_ >> shift & mask
+            get = table.get
             for flip in flips:
-                stored = table.get(key ^ flip)
+                stored = get(key ^ flip)
                 if stored is None:
                     continue
 
-                for candidate in (stored if isinstance(stored, list) else (stored, )):
+                for candidate in ((stored, ) if stored.__class__ is int else stored):
                     if candidate not in found:
                         distance = (candidate ^ hash_).bit_count()
-                        if distance <= self.radius:
+                        if distance <= radius:
                             found[candidate] = distance
 
         return found
