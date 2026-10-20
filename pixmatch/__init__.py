@@ -3,17 +3,18 @@ import logging
 import os
 import time
 
-from bisect import bisect_left, insort
+from bisect import bisect_left, bisect_right, insort
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import partial, wraps
-from itertools import combinations
+from itertools import combinations, repeat
 from multiprocessing import Pool
 from pathlib import Path
 from queue import Queue
 from threading import Event, RLock, Semaphore
-from typing import Callable, ClassVar, Iterable, Sequence
+from typing import Callable, ClassVar, Iterable, Iterator, Sequence
 from zipfile import BadZipFile, ZipFile
 
 import numpy as np
@@ -90,6 +91,11 @@ STRENGTH_RADIUS = (8, 8, 8, 6, 6, 4, 4, 2, 2, 0, 0)
 
 # How often regroup reports its progress (and can be cancelled), in images
 REGROUP_PROGRESS_EVERY = 1000
+
+# The most bits apart two images can be to be each other's neighbours, see find_neighbours: the loosest radius, so
+#   regrouping at any strength only needs them
+NEIGHBOUR_RADIUS = max(STRENGTH_RADIUS)
+NEIGHBOUR_BLOCK = 2048  # How many hashes find_neighbours looks up at once, in each of its threads
 
 # Decoding JPEGs at a reduced size (see calculate_hashes' draft) can move a hash by up to 2 bits. That is harmless
 #   when matches can differ by at least this many bits, but loses matches at stricter strengths.
@@ -447,6 +453,89 @@ class CentreIndex(HammingIndex):
 CENTRE_RADIUS = 4
 
 
+def find_neighbours(images: Sequence[tuple[int, ...]], start: int = 0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Find each image's neighbours: the initial hashes of the images before it that are within NEIGHBOUR_RADIUS of it.
+
+    How far an image is from an initial hash is the fewest bits that any of its hashes differ from it by, just as
+        _find_group measures it from a group's key (which is the initial hash of the group's first image). So when
+        regrouping, the groups an image can join are exactly its neighbours that are group keys by then, within the
+        radius. And as group keys are only ever images that came before, nothing after an image is needed.
+    This is HammingIndex's search, with every image at once in numpy: the hashes of the images are the stored ones,
+        and each distinct initial hash is looked up once. With 260k images, that took ~7s (and ~230MB more while it ran)
+        where looking each image up in a HammingIndex at this radius took 3 minutes.
+
+    Args:
+        images (Sequence[tuple[int, ...]]): Every image's hashes, initial hash first, in the order they're matched in.
+        start (int): Only find the neighbours of images[start:]. The images before it are still neighbours.
+
+    Returns:
+        (indptr, hashes, distances): Image images[start + i]'s neighbours are hashes[indptr[i]:indptr[i + 1]], each
+            with how many bits it is from the image in distances, closest first (then lowest hash first, the order
+            _find_group picks in).
+    """
+    if start >= len(images):
+        return np.zeros(1, dtype=np.int64), np.zeros(0, dtype=np.uint64), np.zeros(0, dtype=np.uint8)
+
+    index = HammingIndex(NEIGHBOUR_RADIUS)
+    owners = np.repeat(np.arange(start, len(images), dtype=np.int32), [len(hashes) for hashes in images[start:]])
+    stored = np.fromiter((hash_ for hashes in images[start:] for hash_ in hashes), dtype=np.uint64, count=len(owners))
+    initial = np.fromiter((hashes[0] for hashes in images), dtype=np.uint64, count=len(images))
+    # Each distinct initial hash, with the first image that has it: only the images after that one are its neighbours
+    queries, first = np.unique(initial, return_index=True)
+    first = first.astype(np.int32)
+
+    def search_block(block_start: int, chunk: tuple[int, int, np.ndarray], tables: tuple[np.ndarray, ...],
+                     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """The (image, query, distance) of every neighbour that a block of queries finds through one chunk"""
+        shift, mask, flips = chunk
+        counts, starts, by_chunk = tables
+        block = queries[block_start:block_start + NEIGHBOUR_BLOCK]
+        # Every value within the chunk's limit of each query's chunk (see HammingIndex), and the stored hashes with it
+        probes = (((block >> np.uint64(shift)) & np.uint64(mask)).astype(np.int32)[:, None] ^ flips[None, :]).ravel()
+        stored_n = counts[probes]
+        hits = stored_n.nonzero()[0]
+        stored_n = stored_n[hits].astype(np.int64)
+        offsets = np.arange(int(stored_n.sum())) - np.repeat(np.cumsum(stored_n) - stored_n, stored_n)
+        positions = by_chunk[np.repeat(starts[probes[hits]], stored_n) + offsets]
+        query_i = np.repeat((hits // len(flips) + block_start).astype(np.int32), stored_n)
+
+        distances = np.bitwise_count(queries[query_i] ^ stored[positions])
+        close = (distances <= NEIGHBOUR_RADIUS).nonzero()[0]
+        image_i = owners[positions[close]]
+        query_i = query_i[close]
+        earlier = (first[query_i] < image_i).nonzero()[0]
+        return image_i[earlier], query_i[earlier], distances[close][earlier]
+
+    # numpy lets go of the GIL for the big array operations, so the blocks run side by side
+    found = []
+    with ThreadPoolExecutor(min(8, os.cpu_count() or 1)) as pool:
+        for shift, mask, flips in index._chunks:
+            values = ((stored >> np.uint64(shift)) & np.uint64(mask)).astype(np.int32)
+            counts = np.bincount(values, minlength=mask + 1).astype(np.int32)
+            tables = (counts, (np.cumsum(counts) - counts).astype(np.int32), np.argsort(values).astype(np.int32))
+            chunk = (shift, mask, np.array(flips, dtype=np.int32))
+            blocks = range(0, len(queries), NEIGHBOUR_BLOCK)
+            found += pool.map(partial(search_block, chunk=chunk, tables=tables), blocks)
+
+    image_i = np.concatenate([image_i for image_i, _, _ in found], dtype=np.int64)
+    query_i = np.concatenate([query_i for _, query_i, _ in found], dtype=np.int64)
+    distances = np.concatenate([distances for _, _, distances in found], dtype=np.uint8)
+
+    # A neighbour is found through every chunk and hash that brings it within reach: keep its closest
+    order = np.lexsort((distances, query_i, image_i))
+    image_i, query_i, distances = image_i[order], query_i[order], distances[order]
+    closest = np.ones(len(image_i), dtype=bool)
+    closest[1:] = (image_i[1:] != image_i[:-1]) | (query_i[1:] != query_i[:-1])
+    image_i, query_i, distances = image_i[closest], query_i[closest], distances[closest]
+
+    # Closest first, then lowest hash first (queries is sorted, so its order is the hashes' order)
+    order = np.lexsort((query_i, distances, image_i))
+    indptr = np.zeros(len(images) - start + 1, dtype=np.int64)
+    np.cumsum(np.bincount(image_i - start, minlength=len(images) - start), out=indptr[1:])
+    return indptr, queries[query_i[order]], distances[order]
+
+
 class ImageMatcher:
     """
     An image matching SDK
@@ -511,6 +600,12 @@ class ImageMatcher:
         #   match everything again at another strength without hashing any of it again.
         self._image_hashes = {}
         self._next_order = 0
+        # Every image's neighbours (see find_neighbours), so regrouping doesn't have to look each image up in an index:
+        #   (the orders of the images they're for, indptr, hashes, distances). Found by the first regroup that needs
+        #   them, and for the images added since by the next one. Removing or moving images doesn't change them:
+        #   the neighbours of images that are gone are skipped, and a hash that's only a neighbour because of an image
+        #   that's gone simply never becomes a group key before the images it's a neighbour of
+        self._neighbours = None
 
         # Matching turned copies: every loaded image's centre hashes are in _centre_index, and _centre_paths says
         #   which images have each of them. Not just each group's first image: that could be a quarter turn of
@@ -799,7 +894,8 @@ class ImageMatcher:
         elif group.match_i is not None:
             self._unmatch(group)
 
-    def _find_group(self, hashes: set, centre: bytes | None = None) -> int | str | None:
+    def _find_group(self, hashes: set, centre: bytes | None = None,
+                    near: Sequence[int] | None = None) -> int | str | None:
         """
         Find the group an image belongs to.
 
@@ -807,11 +903,17 @@ class ImageMatcher:
             hashes (set): All of the image's hashes (every rotation and mirror of it).
             centre (bytes | None): The image's centre hashes. Only used if rotation is on, and no group matched
                 the image as a whole.
+            near (Sequence[int] | None): The image's neighbours within the radius, closest first (see find_neighbours),
+                to pick the group from instead of looking the image up. The first that is a group key is the group.
 
         Returns:
             int | str | None: The key in _hashes of the closest group, or None if no group is close enough.
         """
-        if self._index is None:
+        if near is not None:
+            for hash_ in near:
+                if hash_ in self._hashes:
+                    return hash_
+        elif self._index is None:
             # From testing at ~1.5m loaded images: it is ~10% faster to return a set and do this than it is to
             #   iterate over a list and do an `is in` check for each hash
             found_hashes = self._hashes.keys() & hashes
@@ -974,7 +1076,7 @@ class ImageMatcher:
         return True
 
     def _add_image(self, path: ZipPath, initial_hash: int | str, hashes: set, centre: bytes | None = None, *,
-                   emit: bool = True):
+                   emit: bool = True, near: Sequence[int] | None = None):
         """
         Put an image in the group it matches, or in a group of its own if it matches none. The lock must be held.
 
@@ -984,8 +1086,9 @@ class ImageMatcher:
             hashes (set): All of the image's hashes, including initial_hash.
             centre (bytes | None): The image's centre hashes, for matching turned copies.
             emit (bool): Send events for new groups and matches? Regrouping doesn't, the GUI redraws everything.
+            near (Sequence[int] | None): The image's neighbours within the radius, see _find_group.
         """
-        hash_ = self._find_group(hashes, centre)
+        hash_ = self._find_group(hashes, centre, near)
         if hash_ is None:
             # This is a new image not matching any previous, so just add it to the hashmap and move on...
             #   Just use the initial orientation
@@ -1076,8 +1179,11 @@ class ImageMatcher:
             self._path_centres = {}
 
             images = sorted(self._image_hashes.items(), key=lambda item: item[1][0])
-            for done, (path, (_, hashes, centre)) in enumerate(images, start=1):
-                self._add_image(path, hashes[0], set(hashes), centre, emit=False)
+            # Each image's neighbours within the radius, so it needn't be looked up in the index (which took minutes
+            #   at the loosest strengths). Exact matches are quick to look up anyway
+            nears = self._near_hashes(images) if self.radius else repeat(None, len(images))
+            for done, ((path, (_, hashes, centre)), near) in enumerate(zip(images, nears, strict=True), start=1):
+                self._add_image(path, hashes[0], set(hashes), centre, emit=False, near=near)
                 if progress and done % REGROUP_PROGRESS_EVERY == 0 and not progress(done, len(images)):
                     (self.strength, self.radius, self.rotation, matches, self.duplicate_images, self._hashes,
                      self._reverse_hashes, self._index, self._centre_index, self._centre_paths,
@@ -1089,6 +1195,44 @@ class ImageMatcher:
                 progress(len(images), len(images))
 
         return True
+
+    def _near_hashes(self, images: list[tuple[ZipPath, tuple]]) -> Iterator[list[int]]:
+        """
+        Yield each image's neighbours within the radius (see find_neighbours), closest first.
+
+        Args:
+            images (list[tuple[ZipPath, tuple]]): Every loaded image's _image_hashes item, sorted by their order.
+
+        Yields:
+            list[int]: The next image's neighbours, as their hashes.
+        """
+        if not images:
+            return
+
+        # Find the neighbours of the images that don't have them yet: all of them the first time, then the ones added
+        #   since. Those were added last, so they're the last in the order
+        orders, indptr, near, distances = self._neighbours or ([], np.zeros(1, dtype=np.int64), None, None)
+        start = bisect_right([order for _, (order, _, _) in images], orders[-1]) if orders else 0
+        if start < len(images):
+            new_indptr, new_near, new_distances = find_neighbours([hashes for _, (_, hashes, _) in images], start)
+            orders = orders + [order for _, (order, _, _) in images[start:]]
+            indptr = np.concatenate((indptr, new_indptr[1:] + indptr[-1]))
+            near = new_near if near is None else np.concatenate((near, new_near))
+            distances = new_distances if distances is None else np.concatenate((distances, new_distances))
+            self._neighbours = (orders, indptr, near, distances)
+
+        # Each image's neighbours are sorted closest first, so the ones within the radius come first
+        within = np.zeros(len(distances) + 1, dtype=np.int64)
+        np.cumsum(distances <= self.radius, out=within[1:])
+        starts = indptr[:-1].tolist()
+        ends = (indptr[:-1] + within[indptr[1:]] - within[indptr[:-1]]).tolist()
+
+        # The images that are gone since have neighbours too, so skip theirs
+        row = 0
+        for _, (order, _, _) in images:
+            while orders[row] != order:
+                row += 1
+            yield near[starts[row]:ends[row]].tolist() if starts[row] != ends[row] else []
 
     def _process_image_error_callback(self, e):
         """Log an image that couldn't be hashed, and count it as processed"""
