@@ -105,6 +105,12 @@ CENTRE_WORK = 128  # Everything is sampled from a CENTRE_WORK x CENTRE_WORK arra
 CENTRE_CROP = 0.5  # The hashed square is this fraction of the short side (at the same size)
 CENTRE_SAMPLES = HASH_IMG_SIZE * 2  # Squares are sampled at twice the hash's image size, then averaged down to it
 
+# A middle with less detail than this (the mean gradient of the hashed square, on a 0-255 scale) gets no centre hashes.
+#   A nearly featureless middle, like a dark blob with one edge, hashes much like turned squares of unrelated images:
+#   in a 20k sample of a real library, every false turned match within CENTRE_RADIUS had such a middle on one side
+#   (detail 0.1-3.2), and genuine ones had 9-16. Only ~0.7% of images fall below it, and they still match as a whole.
+CENTRE_MIN_DETAIL = 4.0
+
 # The biggest size a square can be tried at, and still be inside the working array once it's turned (and one more
 #   pixel for interpolating). Very wide or tall images can call for bigger, but then they wouldn't fit.
 _CENTRE_SIDE = CENTRE_CROP * CENTRE_WORK
@@ -184,9 +190,15 @@ def centre_hashes(work: np.ndarray, width: int, height: int) -> bytes | None:
 
     Returns:
         bytes | None: CENTRE_HASHES 64-bit big-endian hashes: the centre hash, then every angle at the same size,
-            smaller, then bigger, then the mirror's centre hash. None if the middle of the image is blank.
+            smaller, then bigger, then the mirror's centre hash. None if the middle of the image is blank, or has too
+            little detail (see CENTRE_MIN_DETAIL).
     """
     if work.std() < FLAT_STD:
+        return None
+
+    edge = round((CENTRE_WORK - _CENTRE_SIDE) / 2)
+    gy, gx = np.gradient(work[edge:CENTRE_WORK - edge, edge:CENTRE_WORK - edge])
+    if np.hypot(gx, gy).mean() < CENTRE_MIN_DETAIL:
         return None
 
     ox, oy = _centre_offsets()
