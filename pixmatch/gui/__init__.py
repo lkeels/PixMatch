@@ -219,6 +219,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.build_menubar()
         self.build_central()
         self.set_thumbnail_size(self._settings.value("view/thumbnail_size", defaultValue=0, type=int), save=False)
+        self.set_keep_thumbnail_shape(
+            self._settings.value("view/keep_thumbnail_shape", defaultValue=False, type=bool), save=False)
         self.build_statusbar()
         self.build_extra()
 
@@ -364,6 +366,10 @@ class MainWindow(QtWidgets.QMainWindow):
         view_menu.addSeparator()
         for action in self._thumbnail_size_actions.values():
             view_menu.addAction(action)
+        # Thumbnails are stretched to fill their square, like VisiPics', unless this is checked
+        self.keep_shape_option = QtGui.QAction("Keep thumbnail shape", self, checkable=True)
+        self.keep_shape_option.triggered.connect(self.set_keep_thumbnail_shape)
+        view_menu.addAction(self.keep_shape_option)
         # endregion
 
         # region Tools menu
@@ -1537,6 +1543,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self._settings.setValue("view/thumbnail_size", px)
 
         self.duplicate_group_list.set_thumb_size(px)
+        if self.processor:
+            self.update_group_list()
+
+    def set_keep_thumbnail_shape(self, keep_shape: bool, *, save: bool = True):  # ruff: ignore[boolean-type-hint-positional-argument]
+        """Show thumbnails in their image's shape, or stretched to fill their square, and remember it for next time"""
+        self.keep_shape_option.setChecked(keep_shape)
+        if save:
+            self._settings.setValue("view/keep_thumbnail_shape", keep_shape)
+
+        self.duplicate_group_list.set_keep_shape(keep_shape)
         if self.processor:
             self.update_group_list()
 

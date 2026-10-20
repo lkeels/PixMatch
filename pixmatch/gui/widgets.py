@@ -94,9 +94,24 @@ STATE_BANNERS = {
 
 
 # region Image view panel
-def _load_thumbnail(path: ZipPath, thumb_size: int, zf: ZipFile | None = None) -> QtGui.QImage:
+def _fit(width: int, height: int, thumb_size: int, *, keep_shape: bool) -> tuple[int, int]:
     """
-    Load an image from disk as a square thumbnail.
+    The size of an image's thumbnail.
+
+    Returns:
+        (width, height): thumb_size square, or with keep_shape, the image's shape shrunk to fit in that square.
+    """
+    if not keep_shape or width <= 0 or height <= 0:
+        return thumb_size, thumb_size
+
+    scale = thumb_size / max(width, height)
+    return max(1, round(width * scale)), max(1, round(height * scale))
+
+
+def _load_thumbnail(path: ZipPath, thumb_size: int, zf: ZipFile | None = None, *,
+                    keep_shape: bool = False) -> QtGui.QImage:
+    """
+    Load an image from disk as a thumbnail: stretched to a square, or with keep_shape, its shape fitted in the square.
 
     The image is decoded straight to the thumbnail's size, which lets JPEGs skip most of the work of decoding them
         in full (a 4K JPEG took ~78ms to load at full size, and ~19ms this way).
@@ -107,16 +122,17 @@ def _load_thumbnail(path: ZipPath, thumb_size: int, zf: ZipFile | None = None) -
     """
     if path.subpath:
         with nullcontext(zf) if zf is not None else ZipFile(path.path) as zip_file:
-            return _decode_thumbnail(zip_file.read(path.subpath), thumb_size)
+            return _decode_thumbnail(zip_file.read(path.subpath), thumb_size, keep_shape=keep_shape)
 
     reader = QtGui.QImageReader(path.path)
-    reader.setScaledSize(QtCore.QSize(thumb_size, thumb_size))
+    size = reader.size()  # From the file's header, without decoding it
+    reader.setScaledSize(QtCore.QSize(*_fit(size.width(), size.height(), thumb_size, keep_shape=keep_shape)))
     return reader.read()
 
 
-def _decode_thumbnail(data: bytes, thumb_size: int) -> QtGui.QImage:
+def _decode_thumbnail(data: bytes, thumb_size: int, *, keep_shape: bool = False) -> QtGui.QImage:
     """
-    Decode an image's data (a file in a zip) as a square thumbnail, with Pillow.
+    Decode an image's data (a file in a zip) as a thumbnail (see _load_thumbnail), with Pillow.
 
     Qt could only read this data through a QBuffer made in Python, and that deadlocked the app: while Qt works out how
         to read an image it holds a lock and calls the buffer, and PySide needs the GIL for those calls. So a thread
@@ -132,12 +148,13 @@ def _decode_thumbnail(data: bytes, thumb_size: int) -> QtGui.QImage:
             if im.mode.startswith("I;16"):
                 # Pillow clips 16-bit values to 0-255 when converting, which turns nearly everything white
                 im = Image.fromarray((np.asarray(im) >> 8).astype(np.uint8))
-            thumbnail = im.convert("RGBA").resize((thumb_size, thumb_size), Image.Resampling.BILINEAR)
+            width, height = _fit(*im.size, thumb_size, keep_shape=keep_shape)
+            thumbnail = im.convert("RGBA").resize((width, height), Image.Resampling.BILINEAR)
     except (OSError, SyntaxError, ValueError, Image.DecompressionBombError):
         return QtGui.QImage()
 
     # Copied so the QImage has its own pixels, instead of pointing at the bytes (which are about to be freed)
-    return QtGui.QImage(thumbnail.tobytes(), thumb_size, thumb_size, QtGui.QImage.Format.Format_RGBA8888).copy()
+    return QtGui.QImage(thumbnail.tobytes(), width, height, QtGui.QImage.Format.Format_RGBA8888).copy()
 
 
 def _decode_image(data: bytes) -> QtGui.QImage:
@@ -815,10 +832,12 @@ def folder_button_icon(button: FolderButton, color: QtGui.QColor) -> QtGui.QIcon
 class _ThumbnailJob(QtCore.QRunnable):
     """Loads thumbnails on a ThumbnailLoader's thread pool. A job's paths are all in the same zip, or it has one path"""
 
-    def __init__(self, paths: list[ZipPath], thumb_size: int, loaded: QtCore.SignalInstance):
+    def __init__(self, paths: list[ZipPath], thumb_size: int, keep_shape: bool,  # ruff: ignore[boolean-type-hint-positional-argument]
+                 loaded: QtCore.SignalInstance):
         super().__init__()
         self.paths = paths
         self.thumb_size = thumb_size
+        self.keep_shape = keep_shape
         self.loaded = loaded
 
     def run(self):
@@ -835,7 +854,7 @@ class _ThumbnailJob(QtCore.QRunnable):
                     with suppress(KeyError, OSError, BadZipFile):
                         if path.subpath and zf is None:
                             zf = open_zip.enter_context(ZipFile(path.path))
-                        image = _load_thumbnail(path, self.thumb_size, zf)
+                        image = _load_thumbnail(path, self.thumb_size, zf, keep_shape=self.keep_shape)
                     self._report(remaining.pop(0), image)
         finally:
             # If loading failed unexpectedly, still report the rest (as empty) so they aren't left pending
@@ -845,7 +864,7 @@ class _ThumbnailJob(QtCore.QRunnable):
     def _report(self, path: ZipPath, image: QtGui.QImage):
         """Hand a thumbnail to the GUI thread"""
         with suppress(RuntimeError):  # The loader was deleted, i.e. the app is closing
-            self.loaded.emit(path, self.thumb_size, image)
+            self.loaded.emit(path, self.thumb_size, self.keep_shape, image)
 
 
 class ThumbnailLoader(QtCore.QObject):
@@ -859,10 +878,12 @@ class ThumbnailLoader(QtCore.QObject):
         100MB is ~6000 thumbnails at 64 pixels and ~1500 at 128.
 
     Signals:
-        thumbnailLoaded(path: ZipPath, thumb_size: int, pixmap: QPixmap): A thumbnail from `get` has loaded.
+        thumbnailLoaded(path: ZipPath, thumb_size: int, keep_shape: bool, pixmap: QPixmap): A thumbnail from `get`
+            has loaded.
     """
-    thumbnailLoaded = QtCore.Signal(ZipPath, int, QtGui.QPixmap)
-    _imageLoaded = QtCore.Signal(ZipPath, int, QtGui.QImage)  # Emitted on the pool's threads, handled on the GUI's
+    thumbnailLoaded = QtCore.Signal(ZipPath, int, bool, QtGui.QPixmap)
+    # Emitted on the pool's threads, handled on the GUI's
+    _imageLoaded = QtCore.Signal(ZipPath, int, bool, QtGui.QImage)
 
     def __init__(self, parent=None, *, threads: int = 4, cache_bytes: int = 100 * 2 ** 20):
         super().__init__(parent)
@@ -870,11 +891,11 @@ class ThumbnailLoader(QtCore.QObject):
         self._pool.setMaxThreadCount(threads)
         self._cache_bytes = cache_bytes
         self._cached_bytes = 0
-        self._cache = OrderedDict()  # (path, thumb_size) -> QPixmap, least recently used first
-        self._pending = set()  # (path, thumb_size) that are loading
+        self._cache = OrderedDict()  # (path, thumb_size, keep_shape) -> QPixmap, least recently used first
+        self._pending = set()  # (path, thumb_size, keep_shape) that are loading
         self._imageLoaded.connect(self._on_image_loaded)
 
-        # Images in zips that were asked for, but not started yet: (zip path, thumb_size) -> paths.
+        # Images in zips that were asked for, but not started yet: (zip path, thumb_size, keep_shape) -> paths.
         #   They're started together once the GUI is done asking (e.g. once a page is built), see _start_zip_jobs
         self._zip_requests = defaultdict(list)
         self._zip_timer = QtCore.QTimer(self, singleShot=True, interval=0)
@@ -885,14 +906,16 @@ class ThumbnailLoader(QtCore.QObject):
         if app is not None:
             app.aboutToQuit.connect(self.cancel)
 
-    def get(self, path: ZipPath, thumb_size: int) -> QtGui.QPixmap | None:
+    def get(self, path: ZipPath, thumb_size: int, *, keep_shape: bool = False) -> QtGui.QPixmap | None:
         """
         Get a thumbnail if it was loaded recently, otherwise start loading it.
+
+        It's thumb_size square, stretched to fill it, or with keep_shape, the image's shape fitted in that square.
 
         Returns:
             QtGui.QPixmap | None: The thumbnail, or None if it is loading. thumbnailLoaded is emitted when it's ready.
         """
-        key = (path, thumb_size)
+        key = (path, thumb_size, keep_shape)
         pixmap = self._cache.get(key)
         if pixmap is not None:
             self._cache.move_to_end(key)
@@ -901,10 +924,10 @@ class ThumbnailLoader(QtCore.QObject):
         if key not in self._pending:
             self._pending.add(key)
             if path.subpath:
-                self._zip_requests[path.path, thumb_size].append(path)
+                self._zip_requests[path.path, thumb_size, keep_shape].append(path)
                 self._zip_timer.start()
             else:
-                self._pool.start(_ThumbnailJob([path], thumb_size, self._imageLoaded))
+                self._pool.start(_ThumbnailJob([path], thumb_size, keep_shape, self._imageLoaded))
 
         return None
 
@@ -928,11 +951,11 @@ class ThumbnailLoader(QtCore.QObject):
             slowed down the GUI too. So each zip is opened once per thread that loads images from it,
             rather than once per image.
         """
-        for (_, thumb_size), paths in self._zip_requests.items():
+        for (_, thumb_size, keep_shape), paths in self._zip_requests.items():
             # Every thread gets some of the zip's images, so they still load in parallel (and the top rows first)
             jobs = min(self._pool.maxThreadCount(), len(paths))
             for i in range(jobs):
-                self._pool.start(_ThumbnailJob(paths[i::jobs], thumb_size, self._imageLoaded))
+                self._pool.start(_ThumbnailJob(paths[i::jobs], thumb_size, keep_shape, self._imageLoaded))
 
         self._zip_requests.clear()
 
@@ -941,9 +964,10 @@ class ThumbnailLoader(QtCore.QObject):
         """Roughly how much memory a thumbnail takes"""
         return pixmap.width() * pixmap.height() * 4
 
-    def _on_image_loaded(self, path: ZipPath, thumb_size: int, image: QtGui.QImage):
+    def _on_image_loaded(self, path: ZipPath, thumb_size: int, keep_shape: bool,  # ruff: ignore[boolean-type-hint-positional-argument]
+                         image: QtGui.QImage):
         """Keep a thumbnail that finished loading, and pass it on as a QPixmap (which only the GUI thread can make)"""
-        key = (path, thumb_size)
+        key = (path, thumb_size, keep_shape)
         self._pending.discard(key)
         pixmap = QtGui.QPixmap.fromImage(image)
         if not pixmap.isNull():
@@ -956,7 +980,7 @@ class ThumbnailLoader(QtCore.QObject):
             while self._cached_bytes > self._cache_bytes and len(self._cache) > 1:
                 self._cached_bytes -= self._pixmap_bytes(self._cache.popitem(last=False)[1])
 
-        self.thumbnailLoaded.emit(path, thumb_size, pixmap)
+        self.thumbnailLoaded.emit(path, thumb_size, keep_shape, pixmap)
 
 
 class StateBanner(QtWidgets.QWidget):
@@ -1215,10 +1239,11 @@ class DuplicateGroupRow(QtWidgets.QWidget):
     tileMenuAction = QtCore.Signal(str, ZipPath)
 
     def __init__(self, images: Sequence[ZipPath], thumb_size: int = 32, parent=None, *, thumbnails: ThumbnailLoader,
-                 columns: int = 1):
+                 columns: int = 1, keep_shape: bool = False):
         super().__init__(parent)
         self._tiles: list[ThumbnailTile] = []
         self._thumb_size = thumb_size
+        self._keep_shape = keep_shape
         self._columns = max(1, columns)
         self._thumbnails = thumbnails
         self._thumbnails.thumbnailLoaded.connect(self._on_thumbnail_loaded)
@@ -1248,7 +1273,7 @@ class DuplicateGroupRow(QtWidgets.QWidget):
     def add_tile(self, path: ZipPath):
         """Add a new tile to this duplicate group"""
         # If the thumbnail wasn't loaded recently, the tile starts empty and it's shown once it loads
-        pixmap = self._thumbnails.get(path, self._thumb_size)
+        pixmap = self._thumbnails.get(path, self._thumb_size, keep_shape=self._keep_shape)
         tile = ThumbnailTile(path=path, pixmap=pixmap, thumb_size=self._thumb_size)
         tile.stateChanged.connect(self.tileStateChanged)
         tile.hovered.connect(self.tileHovered)
@@ -1269,9 +1294,10 @@ class DuplicateGroupRow(QtWidgets.QWidget):
         for i, tile in enumerate(self._tiles):
             self._grid.addWidget(tile, *divmod(i, columns))
 
-    def _on_thumbnail_loaded(self, path: ZipPath, thumb_size: int, pixmap: QtGui.QPixmap):
+    def _on_thumbnail_loaded(self, path: ZipPath, thumb_size: int, keep_shape: bool,  # ruff: ignore[boolean-type-hint-positional-argument]
+                             pixmap: QtGui.QPixmap):
         """A thumbnail finished loading, so show it on this group's tiles for that image"""
-        if thumb_size != self._thumb_size:
+        if thumb_size != self._thumb_size or keep_shape != self._keep_shape:
             return
 
         for tile in self._tiles:
@@ -1344,6 +1370,7 @@ class DuplicateGroupList(QtWidgets.QWidget):
     def __init__(self, parent=None, *, thumb_size: int = 64, **kwargs):
         super().__init__(parent, **kwargs)
         self._thumb_size = thumb_size
+        self._keep_shape = False  # See set_keep_shape
         self._thumbnails = ThumbnailLoader(self)
         self._tile_size = None  # The size of a tile, measured the first time it's needed
         self._page_size = None  # (tiles per line, page height) when the pages were last worked out
@@ -1394,6 +1421,14 @@ class DuplicateGroupList(QtWidgets.QWidget):
         """Set the thumbnail size for the groups shown from now on (set_groups)"""
         self._thumb_size = max(32, int(px))
         self._tile_size = None
+
+    def set_keep_shape(self, keep_shape: bool) -> None:  # ruff: ignore[boolean-type-hint-positional-argument]
+        """
+        Show thumbnails in their image's shape (fitted in the square), or stretched to fill it, from now on.
+
+        The tiles stay the same square size either way, so it doesn't change what fits on a page.
+        """
+        self._keep_shape = keep_shape
 
     def tile_size(self) -> QtCore.QSize:
         """The size a thumbnail tile takes up"""
@@ -1474,7 +1509,7 @@ class DuplicateGroupList(QtWidgets.QWidget):
     def add_group(self, group: Sequence[ZipPath]) -> None:
         """Add a new match group, requiring a new row"""
         row = DuplicateGroupRow(group, thumb_size=self._thumb_size, thumbnails=self._thumbnails,
-                                columns=self.page_size()[0])
+                                columns=self.page_size()[0], keep_shape=self._keep_shape)
         row.tileStateChanged.connect(self.groupTileStateChanged)
         row.tileHovered.connect(self.groupTileHovered)
         row.tileMenuAction.connect(self.groupTileMenuAction)
