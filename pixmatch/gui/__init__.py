@@ -557,9 +557,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.rotation_chkbx.setToolTip(
             "Also match copies turned by a few degrees (up to about 12), like a crooked scan\n"
             "or a re-photographed print. Copies turned 90 or 180 degrees, and mirror images,\n"
-            "are always matched.",
+            "are always matched.\n"
+            "It can also group some images that aren't copies, when only their middles look alike.",
         )
         self.rotation_chkbx.toggled.connect(self.schedule_regroup)
+        self.rotation_chkbx.clicked.connect(self.on_rotation_clicked)
         filter_checkboxes = QtWidgets.QHBoxLayout()
         filter_checkboxes.setContentsMargins(NO_MARGIN)
         filter_checkboxes.addWidget(self.hash_match_chkbx)
@@ -692,6 +694,30 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_hash_match_toggled(self, checked: bool):  # ruff: ignore[boolean-type-hint-positional-argument]
         """SHA-256 hashes only match identical files, so they can't find turned copies"""
         self.rotation_chkbx.setEnabled(not checked and self.precision_slider.isEnabled())
+        self.schedule_regroup()
+
+    def on_rotation_clicked(self, checked: bool):  # ruff: ignore[boolean-type-hint-positional-argument]
+        """Tilted copies was ticked: say that it can also group images that aren't copies"""
+        if not checked or self._settings.value("warnings/hide_tilted_extra", defaultValue=False, type=bool):
+            return
+
+        # The regroup waits until the message is closed (toggled has already scheduled it)
+        self._regroup_timer.stop()
+        dlg = QtWidgets.QMessageBox(self)
+        dlg.setIcon(QtWidgets.QMessageBox.Icon.Information)
+        dlg.setWindowTitle("Tilted copies")
+        dlg.setText(
+            "Tilted copies finds copies turned by a few degrees, but it can also group some images that "
+            "aren't copies, when only their middles look alike.\n\n"
+            "Check its groups before deleting, or untick it to see only the usual matches.",
+        )
+        # Kept here: PySide loses track of it, so dlg.checkBox() can't be read back
+        dont_show = QtWidgets.QCheckBox("Don't show this again")
+        dlg.setCheckBox(dont_show)
+        dlg.exec()
+        if dont_show.isChecked():
+            self._settings.setValue("warnings/hide_tilted_extra", True)  # ruff: ignore[boolean-positional-value-in-call]
+
         self.schedule_regroup()
 
     def rotation_wanted(self) -> bool:
