@@ -1069,6 +1069,11 @@ class ThumbnailTile(QtWidgets.QFrame):
             self._image.setPixmap(pixmap)
         self._image.setFixedSize(thumb_size, thumb_size)
 
+        # Every mouse move over the tile says it's hovered (see mouseMoveEvent), not only its Enter event. The image
+        #   gets most of the moves, and Qt drops a move a widget doesn't track instead of passing it up to the tile
+        self.setMouseTracking(True)
+        self._image.setMouseTracking(True)
+
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(NO_MARGIN)
         lay.setSpacing(0)
@@ -1214,6 +1219,17 @@ class ThumbnailTile(QtWidgets.QFrame):
         """Fire hover events"""
         self.hovered.emit(self._path)
         super().enterEvent(e)
+
+    def mouseMoveEvent(self, e: QtGui.QMouseEvent):
+        """
+        Fire hover events on every move too (DuplicateGroupList only passes on the first for each tile).
+
+        With fractional display scaling (like 150%), the mouse can come into the tile at a fraction of a pixel above
+            its top edge (y = -0.003): Qt gives the tile the move, but doesn't send it its Enter event, because the
+            point isn't inside it. So moving down into a tile didn't always update the preview.
+        """
+        self.hovered.emit(self._path)
+        super().mouseMoveEvent(e)
 
     def _apply_state_style(self):
         """Show the state's banner over the thumbnail"""
@@ -1387,6 +1403,14 @@ class DuplicateGroupList(QtWidgets.QWidget):
         self._vbox.addItem(_tail_spacer)
         self._scroll.setWidget(self._container)
 
+        # Tiles say they're hovered on every mouse move as well as on Enter (see ThumbnailTile.mouseMoveEvent), and the
+        #   page does too for moves Qt gives to the page itself but which are over a tile (with fractional display
+        #   scaling, a tile's edge can round either way): the tile is the one QApplication.widgetAt finds there.
+        #   _hover passes on each tile once, until the mouse goes to another
+        self._container.setMouseTracking(True)
+        self._container.installEventFilter(self)
+        self._hovered = None  # The path of the tile the mouse was last over, see _hover
+
         # Main layout
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(NO_MARGIN)
@@ -1511,7 +1535,7 @@ class DuplicateGroupList(QtWidgets.QWidget):
         row = DuplicateGroupRow(group, thumb_size=self._thumb_size, thumbnails=self._thumbnails,
                                 columns=self.page_size()[0], keep_shape=self._keep_shape)
         row.tileStateChanged.connect(self.groupTileStateChanged)
-        row.tileHovered.connect(self.groupTileHovered)
+        row.tileHovered.connect(self._hover)
         row.tileMenuAction.connect(self.groupTileMenuAction)
         tail_index = self._vbox.count() - 1
         self._vbox.insertWidget(tail_index, row)
@@ -1523,8 +1547,28 @@ class DuplicateGroupList(QtWidgets.QWidget):
             for tile in row.tiles():
                 tile.state = SelectionValues.KEEP
 
+    def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        """The mouse moved over the page: say which tile it's over, if that changed (see __init__)"""
+        if watched is self._container and event.type() == QtCore.QEvent.Type.MouseMove:
+            widget = QtWidgets.QApplication.widgetAt(event.globalPosition().toPoint())
+            while widget is not None and not isinstance(widget, ThumbnailTile):
+                widget = widget.parentWidget()
+            if widget is not None:
+                self._hover(widget.path)
+        elif watched is self._container and event.type() == QtCore.QEvent.Type.Leave:
+            self._hovered = None  # So coming back to the same tile shows it again
+
+        return super().eventFilter(watched, event)
+
+    def _hover(self, path: ZipPath):
+        """The mouse is over this tile: say so, once each time it moves to a different tile"""
+        if path != self._hovered:
+            self._hovered = path
+            self.groupTileHovered.emit(path)
+
     def clear(self):
         """Reset this widget"""
+        self._hovered = None  # The page is rebuilt (and the preview cleared), so the tile under the mouse is new
         self._thumbnails.cancel()  # Any thumbnails still waiting to load were for these rows
         for row in self._rows:
             row.setParent(None)
