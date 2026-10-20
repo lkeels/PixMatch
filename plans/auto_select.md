@@ -1,6 +1,6 @@
 # Auto-select
 
-Status: **building**. Step 1 (measuring quality) is done. The Auto-select menu item and button exist but are disabled.
+Status: **building**. Steps 1 (measuring quality) and 2 (the decision rules) are done. The Auto-select menu item and button exist but are disabled.
 
 ## Goal
 
@@ -89,8 +89,15 @@ Settled 2026-10-20.
    `ImageMatcher.quality(path)`. Hashes unchanged; costs ~1ms an image. In 800 library images: 80 grey
    (colourfulness < 2), 13 tinted (colour variety < 1.5), 707 colour, 24 between tinted and colour (variety 1.5-3) to
    look at when tuning.
-2. The decision rules, tested on made-up groups covering every case above.
+2. The decision rules, tested on made-up groups covering every case above. **Done**: `pixmatch/autoselect.py`, `decide(group)`
+   returns a `Decision` (keep, mark, move, or why the group was left alone). 57 checks on made-up groups pass. Not in
+   the plan above: when copies beat each other in a circle (sharper, but a smaller file, but a higher JPEG quality),
+   none is clearly best, so they're treated as about equal; and a clearly worse copy in a higher folder still pulls the
+   kept copy up into its place when several copies tie. Tried on T, B and Unsorted (113,691 images, 380 groups at
+   Basic): 314 kept with the rest marked, 2 moves (both right), 49 colour conflicts (47 truly grey), 15 animated.
 3. MOVE TO: the state, its banner and hover, Apply carrying out deletes and replacements, and the right-click
    "Replace...".
 4. Auto-select itself: warning, progress and Cancel, the summary dialog.
-5. Tuning "clearly better" and the name check on your library.
+5. Tuning "clearly better" and the name check on your library. Seen so far: AI upscales (`...gigapixel-scale-2_00x.png`) win on
+   pixels over their originals; and a 540x812 copy at JPEG quality 89 beat a 600x901 one at 73 (23% more pixels is
+   under the 25% bar, so compression decided).
