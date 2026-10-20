@@ -1125,7 +1125,7 @@ class ThumbnailTile(QtWidgets.QFrame):
 
 class DuplicateGroupRow(QtWidgets.QWidget):
     """
-    A single row of thumbnails representing one duplicate group.
+    The thumbnails of one duplicate group, wrapped onto as many lines as they need (see set_columns).
 
     Signals:
         tileStateChanged(path: ZipPath, state: SelectionValue)
@@ -1136,20 +1136,28 @@ class DuplicateGroupRow(QtWidgets.QWidget):
     tileHovered = QtCore.Signal(ZipPath)
     tileMenuAction = QtCore.Signal(str, ZipPath)
 
-    def __init__(self, images: Sequence[ZipPath], thumb_size: int = 32, parent=None, *, thumbnails: ThumbnailLoader):
+    def __init__(self, images: Sequence[ZipPath], thumb_size: int = 32, parent=None, *, thumbnails: ThumbnailLoader,
+                 columns: int = 1):
         super().__init__(parent)
         self._tiles: list[ThumbnailTile] = []
         self._thumb_size = thumb_size
+        self._columns = max(1, columns)
         self._thumbnails = thumbnails
         self._thumbnails.thumbnailLoaded.connect(self._on_thumbnail_loaded)
+
+        # The tiles are in a grid, kept to the left by a stretch after it
+        self._grid = QtWidgets.QGridLayout()
+        self._grid.setContentsMargins(NO_MARGIN)
+        self._grid.setSpacing(0)
         self.layout = QtWidgets.QHBoxLayout(self)
         self.layout.setContentsMargins(NO_MARGIN)
         self.layout.setSpacing(0)
+        self.layout.addLayout(self._grid)
+        self.layout.addStretch(1)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Fixed)
 
         for path in images:
             self.add_tile(path)
-
-        self.layout.addStretch(1)
 
     def __len__(self) -> int:
         """Define len operator for conveince"""
@@ -1168,7 +1176,20 @@ class DuplicateGroupRow(QtWidgets.QWidget):
         tile.hovered.connect(self.tileHovered)
         tile.menuAction.connect(self.tileMenuAction)
         self._tiles.append(tile)
-        self.layout.insertWidget(len(self._tiles) - 1, tile)
+        self._grid.addWidget(tile, *divmod(len(self._tiles) - 1, self._columns))
+
+    def set_columns(self, columns: int):
+        """Wrap the tiles after this many on a line"""
+        columns = max(1, columns)
+        if columns == self._columns:
+            return
+
+        self._columns = columns
+        for tile in self._tiles:
+            self._grid.removeWidget(tile)
+
+        for i, tile in enumerate(self._tiles):
+            self._grid.addWidget(tile, *divmod(i, columns))
 
     def _on_thumbnail_loaded(self, path: ZipPath, thumb_size: int, pixmap: QtGui.QPixmap):
         """A thumbnail finished loading, so show it on this group's tiles for that image"""
@@ -1193,9 +1214,41 @@ class ClickableLabel(QtWidgets.QLabel):
             super().mouseReleaseEvent(event)
 
 
+def paginate(sizes: Sequence[int], per_line: int, line_height: int, gap: int, page_height: int) -> list[int]:
+    """
+    Split groups into pages that fit, without splitting a group across pages.
+
+    Args:
+        sizes (Sequence[int]): How many images each group has, in order.
+        per_line (int): How many tiles fit on a line.
+        line_height (int): The height of a line of tiles.
+        gap (int): The space between groups.
+        page_height (int): The height a page has to fit in.
+
+    Returns:
+        list[int]: The index of the first group on each page (always at least [0]). A group too tall for a page gets
+            a page of its own.
+    """
+    starts = [0]
+    used = 0
+    for i, size in enumerate(sizes):
+        height = -(-size // per_line) * line_height
+        if used and used + gap + height > page_height:
+            starts.append(i)
+            used = height
+        else:
+            used += (gap if used else 0) + height
+
+    return starts
+
+
 class DuplicateGroupList(QtWidgets.QWidget):
     """
-    Scrollable list of duplicate groups. Each group renders as a row of thumbnails.
+    Pages of duplicate groups. Each group's thumbnails wrap onto as many lines as they need.
+
+    A page holds as many whole groups as fit in the list without scrolling: see page_starts. A group too big to fit
+        gets a page of its own, and only then can the page be scrolled. When the list's size changes so that a
+        different number fit, pageSizeChanged is emitted, for the pages to be worked out again.
 
     Notes:
         - Clicking a thumbnail cycles KEEP → MARK → IGNORE.
@@ -1206,18 +1259,23 @@ class DuplicateGroupList(QtWidgets.QWidget):
     groupTileHovered = QtCore.Signal(ZipPath)
     groupTileMenuAction = QtCore.Signal(str, ZipPath)  # action, path. See ThumbnailTile.menuAction
     pageIndicatorClicked = QtCore.Signal()
+    pageSizeChanged = QtCore.Signal()
 
-    def __init__(self, parent=None, *, max_rows: int = 25, thumb_size: int = 64, **kwargs):
+    GROUP_GAP = 8  # The space between groups (tiles in a group have none)
+
+    def __init__(self, parent=None, *, thumb_size: int = 64, **kwargs):
         super().__init__(parent, **kwargs)
-        self._max_rows = max_rows
         self._thumb_size = thumb_size
         self._thumbnails = ThumbnailLoader(self)
+        self._tile_size = None  # The size of a tile, measured the first time it's needed
+        self._page_size = None  # (tiles per line, page height) when the pages were last worked out
 
         self._scroll = QtWidgets.QScrollArea(widgetResizable=True)
+        self._scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._container = QtWidgets.QWidget()
         self._vbox = QtWidgets.QVBoxLayout(self._container)
         self._vbox.setContentsMargins(NO_MARGIN)
-        self._vbox.setSpacing(0)
+        self._vbox.setSpacing(self.GROUP_GAP)
         _tail_spacer = QtWidgets.QSpacerItem(
             0, 0, QtWidgets.QSizePolicy.Policy.Minimum, QtWidgets.QSizePolicy.Policy.Expanding,
         )
@@ -1250,25 +1308,86 @@ class DuplicateGroupList(QtWidgets.QWidget):
 
         self.update_page_indicator(1, 1)
 
-    def set_max_rows(self, n: int) -> None:
-        """Set maximum visible rows (groups)."""
-        self._max_rows = max(1, int(n))
+        # Resizing sends many resize events: the pages are worked out again once it settles
+        self._resize_timer = QtCore.QTimer(self, singleShot=True, interval=150)
+        self._resize_timer.timeout.connect(self._check_page_size)
 
     def set_thumb_size(self, px: int) -> None:
         """Set square thumbnail size for subsequent loads."""
         self._thumb_size = max(32, int(px))
+        self._tile_size = None
+
+    def tile_size(self) -> QtCore.QSize:
+        """The size a thumbnail tile takes up"""
+        if self._tile_size is None:
+            self._tile_size = ThumbnailTile(ZipPath(""), thumb_size=self._thumb_size).sizeHint()
+
+        return self._tile_size
+
+    def page_size(self) -> tuple[int, int]:
+        """
+        How much fits on a page.
+
+        Returns:
+            (tiles per line, page height): Without a scroll bar, which a page only has if its group doesn't fit.
+        """
+        viewport = self._scroll.maximumViewportSize()
+        return max(1, viewport.width() // self.tile_size().width()), viewport.height()
+
+    def page_starts(self, sizes: Sequence[int]) -> list[int]:
+        """
+        Split groups into pages that fit in the list as it is now (see paginate).
+
+        Args:
+            sizes (Sequence[int]): How many images each group has, in order.
+
+        Returns:
+            list[int]: The index of the first group on each page.
+        """
+        self._page_size = per_line, page_height = self.page_size()
+        return paginate(sizes, per_line, self.tile_size().height(), self.GROUP_GAP, page_height)
+
+    def resizeEvent(self, event: QtGui.QResizeEvent):
+        """Once the size settles, say if a different number of groups would fit on a page"""
+        super().resizeEvent(event)
+        self._resize_timer.start()
+
+    def _check_page_size(self):
+        """Say if a different number of groups would fit on a page than when the pages were worked out"""
+        if self._page_size is not None and self.page_size() != self._page_size:
+            self.pageSizeChanged.emit()
+
+    def _columns(self) -> int:
+        """How many tiles fit on a line, leaving room for a scroll bar if the page is too tall to fit"""
+        per_line, page_height = self.page_size()
+        tile = self.tile_size()
+        height = sum(-(-len(row) // per_line) * tile.height() for row in self._rows)
+        height += self.GROUP_GAP * max(0, len(self._rows) - 1)
+        if height <= page_height:
+            return per_line
+
+        scroll_bar = self.style().pixelMetric(QtWidgets.QStyle.PixelMetric.PM_ScrollBarExtent)
+        return max(1, (self._scroll.maximumViewportSize().width() - scroll_bar) // tile.width())
 
     def set_groups(self, groups: Sequence[Sequence[ZipPath]]) -> None:
         """
-        Load duplicate groups.
+        Show a page of duplicate groups.
 
         Args:
-            groups: An iterable of groups; each group is an iterable of image file paths.
-                    Only the first `max_rows` groups are shown.
+            groups: The groups on the page; each group is a sequence of image file paths.
         """
         self.clear()
-        for group in groups[: self._max_rows]:
+        for group in groups:
             self.add_group(group)
+
+        self.relayout()
+        self._scroll.verticalScrollBar().setValue(0)
+
+    def relayout(self):
+        """Wrap every group's tiles to the width there is now"""
+        columns = self._columns()
+        for row in self._rows:
+            row.set_columns(columns)
 
     def update_page_indicator(self, current_page: int, total_pages: int):
         """Update page indicator label"""
@@ -1276,10 +1395,8 @@ class DuplicateGroupList(QtWidgets.QWidget):
 
     def add_group(self, group: Sequence[ZipPath]) -> None:
         """Add a new match group, requiring a new row"""
-        if len(self._rows) == self._max_rows:
-            raise ValueError("Cannot add a new group to a fully filled group list!")
-
-        row = DuplicateGroupRow(group, thumb_size=self._thumb_size, thumbnails=self._thumbnails)
+        row = DuplicateGroupRow(group, thumb_size=self._thumb_size, thumbnails=self._thumbnails,
+                                columns=self.page_size()[0])
         row.tileStateChanged.connect(self.groupTileStateChanged)
         row.tileHovered.connect(self.groupTileHovered)
         row.tileMenuAction.connect(self.groupTileMenuAction)

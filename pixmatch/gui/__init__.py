@@ -1,6 +1,7 @@
 # TODO: Validate that users don't select overlapping paths...
 
 
+import bisect
 import logging
 import os
 import shutil
@@ -56,11 +57,6 @@ class FileAction(Enum):
     DELETE = 'delete'
     MOVE = 'move'
     IGNORE = 'ignore'
-
-
-def ceildiv(a, b):
-    """The opposite of floordiv, //"""
-    return -(a // -b)
 
 
 def project_version() -> str:
@@ -193,6 +189,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.deleted_files_count = 0
         self.deleted_files_size = 0
         self.current_page: int = 1
+        # The index of the first group on each page (see DuplicateGroupList.page_starts), and of the first group on the
+        #   page that's shown. The page that's shown always starts where it did, until it's rebuilt
+        self._page_starts = [0]
+        self._shown_from = 0
         # The seq of the last event the page already has (see update_group_list). Reset it if the processor is replaced
         self._page_seq = 0
         self.processor = None
@@ -659,6 +659,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.duplicate_group_list.first_page.pressed.connect(self.on_page_first)
         self.duplicate_group_list.last_page.pressed.connect(self.on_page_last)
         self.duplicate_group_list.pageIndicatorClicked.connect(self.on_page_jump_request)
+        self.duplicate_group_list.pageSizeChanged.connect(self.refresh_pages)
+        # While scanning, groups are added and grow, which changes what fits on each page: the pages are worked out
+        #   again a little after, rather than on every new image
+        self._pages_timer = QtCore.QTimer(self, singleShot=True, interval=300)
+        self._pages_timer.timeout.connect(self.refresh_pages)
         outer_splitter.addWidget(self.duplicate_group_list)
         outer_splitter.addWidget(inner_splitter)
 
@@ -871,6 +876,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._regroup_failed = False
         self.file_states = {}
         self.current_page = 1
+        self._page_starts = [0]
+        self._shown_from = 0
         self._elapsed_secs = 0
         self._timer_label.setText("00:00:00")
         self.image_view_area.clear()
@@ -980,7 +987,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # Nothing has been scanned yet, so there's only the one empty page
             return 1
 
-        return ceildiv(len(self.processor.matches), self.duplicate_group_list._max_rows) or 1
+        return len(self._page_starts)
 
     def on_finish(self):
         """Finish callback, to update GUI when processing has completed"""
@@ -997,26 +1004,63 @@ class MainWindow(QtWidgets.QMainWindow):
         self.rotation_chkbx.setEnabled(not self.hash_match_chkbx.isChecked())
         self.on_precision_adjust(self.precision_slider.value())
 
-    def on_new_match_group_found(self, event: NewGroup):
-        """New match group found callback, update the GUI with new match group"""
-        page_this_belongs_on, _ = divmod(event.group.match_i, self.duplicate_group_list._max_rows)
-        self.duplicate_group_list.update_page_indicator(self.current_page, self.total_pages)
-
-        # If the page was rebuilt after this event was sent, it already has this group
-        if event.seq > self._page_seq and self.current_page == page_this_belongs_on + 1:
-            self.duplicate_group_list.add_group(event.group.matches)
-
+    def on_new_match_group_found(self, _event: NewGroup):
+        """A new group was found. It goes after the others, so if it fits on the page shown, refresh_pages adds it"""
+        self._pages_timer.start()
         self.set_duplicate_groups_label(len(self.processor.matches))
 
     def on_new_match_found(self, event: NewMatch):
         """New match found callback, update the GUI with new match"""
-        page_this_belongs_on, row_this_is = divmod(event.group.match_i, self.duplicate_group_list._max_rows)
+        row_this_is = event.group.match_i - self._shown_from
 
         # If the page was rebuilt after this event was sent, it already has this image
-        if event.seq > self._page_seq and self.current_page == page_this_belongs_on + 1:
-            self.duplicate_group_list._rows[row_this_is].add_tile(event.path)
+        rows = self.duplicate_group_list._rows
+        if event.seq > self._page_seq and 0 <= row_this_is < len(rows):
+            rows[row_this_is].add_tile(event.path)
+            self.duplicate_group_list.relayout()
 
+        # The group may not fit on its page anymore, or (on the page shown) push the last group off it
+        self._pages_timer.start()
         self.set_duplicate_images_label(self.processor.duplicate_images)
+
+    def refresh_pages(self):
+        """
+        Work out the pages again, for groups found or grown since, or a different size of list.
+
+        The page shown is rebuilt only if it would show different groups now, so the preview isn't cleared for nothing.
+        """
+        if not self.processor:
+            return
+
+        self._repaginate()
+        page = self.current_page
+        shown = (self._shown_from, len(self.duplicate_group_list._rows))
+        now = (self._page_starts[page - 1], self._page_end(page) - self._page_starts[page - 1])
+        if shown != now:
+            self.update_group_list()
+            return
+
+        self.duplicate_group_list.relayout()  # The same groups, but maybe a different width to wrap them to
+        self.duplicate_group_list.update_page_indicator(self.current_page, self.total_pages)
+
+    def _page_end(self, page: int) -> int:
+        """The index after the last group on this page"""
+        return self._page_starts[page] if page < len(self._page_starts) else len(self.processor.matches)
+
+    def _repaginate(self, sizes: list[int] | None = None):
+        """
+        Work out which groups are on each page, staying on the page with the group the shown page starts with.
+
+        Args:
+            sizes (list[int] | None): How many images each group has, if they've just been counted.
+        """
+        if sizes is None:
+            with self.processor.paused():
+                sizes = [len(group.matches) for group in self.processor.matches]
+
+        first = self._page_starts[min(self.current_page, len(self._page_starts)) - 1]
+        self._page_starts = self.duplicate_group_list.page_starts(sizes)
+        self.current_page = bisect.bisect_right(self._page_starts, first)
 
     def change_hidden_folders_state(self, checked: bool):  # ruff: ignore[boolean-type-hint-positional-argument]
         """Set the file_system_model filter based on if we should show hidden folders"""
@@ -1418,11 +1462,10 @@ class MainWindow(QtWidgets.QMainWindow):
     # endregion
 
     def update_group_list(self):
-        """Update the duplicate group list"""
+        """Work out the pages again, and show the current one"""
         self.image_view_area.clear()
+        self._pages_timer.stop()
 
-        row_count = self.duplicate_group_list._max_rows
-        page_start = (self.current_page - 1) * row_count
         with self.processor.paused():
             # The page is built from the processor's data as it is now, which has the changes of every event sent so
             #   far. So events that are still queued are skipped when they arrive, by their seq. Later events are
@@ -1430,8 +1473,11 @@ class MainWindow(QtWidgets.QMainWindow):
             #   removing files, and that always rebuilds the page after.
             #   The groups are copied, since they keep changing after this
             self._page_seq = self.processor.events_sent
-            groups = [list(m.matches) for m in self.processor.matches[page_start:page_start + row_count]]
+            self._repaginate([len(group.matches) for group in self.processor.matches])
+            start, end = self._page_starts[self.current_page - 1], self._page_end(self.current_page)
+            groups = [list(m.matches) for m in self.processor.matches[start:end]]
 
+        self._shown_from = start
         self.duplicate_group_list.set_groups(groups)
         self.update_selection_states()
         self.duplicate_group_list.update_page_indicator(self.current_page, self.total_pages)
