@@ -36,8 +36,10 @@ Simply select some folders to parse and then click begin.
 Once duplicate groups begin to appear in the duplicates view,
     you can start to select actions for them and then execute those actions. 
 Clicking on a tile will cycle through marked, ignored, then neither, with a banner across the tile saying which.
-    The Delete and Move actions act on every MARKED file (Move asks which folder to move them to),
-    and Save ignored takes every IGNORED file out of the results.
+    The Delete and Move actions act on every MARKED file (Move asks which folder to move them to).
+    IGNORED files are remembered between runs, and a group is hidden as soon as every file in it is IGNORED.
+    Ignored files still find their duplicates: if a new duplicate turns up, the group is shown again.
+    Options > Show fully ignored groups brings the hidden groups back, to un-ignore them.
     Moving never replaces a file: if the name is taken, the moved file gets " (2)", " (3)"... added to its name.
 
 Right-clicking a tile can also act on its group right away: keep it and delete the others,

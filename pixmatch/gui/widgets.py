@@ -38,7 +38,8 @@ class SelectionState(Enum):
     """
     Per-thumbnail action state.
 
-    The Delete and Move actions act on every MARK file, and Save ignored on every IGNORE one.
+    The Delete and Move actions act on every MARK file. IGNORE is saved straight away, and a group whose files are all
+        IGNORE is hidden (see pixmatch.ignored).
     """
     KEEP = 'keep'
     MARK = 'mark'
@@ -1066,8 +1067,8 @@ class ThumbnailTile(QtWidgets.QFrame):
         """
         Build the right click menu.
 
-        The first sections mark files, which nothing happens to until an action (Delete, Move, Save ignored) is
-            pressed. The "this, others" section moves or deletes files right away.
+        The first sections mark files: nothing happens to MARKED ones until an action (Delete, Move) is pressed, and
+            ignoring takes effect straight away. The "this, others" section moves or deletes files right away.
 
         Returns:
             QtWidgets.QMenu: The menu.

@@ -32,6 +32,7 @@ from pixmatch.gui.widgets import (
     folder_button_icon,
     same_folder,
 )
+from pixmatch.ignored import IgnoredImages
 from pixmatch.utils import human_bytes
 
 # Allow damaged images, and very large ones. These Pillow settings apply to the whole process, so the app sets them
@@ -55,10 +56,9 @@ logger = logging.getLogger(__name__)
 
 
 class FileAction(Enum):
-    """What the Delete, Move and Save ignored actions do"""
+    """What the Delete and Move actions do"""
     DELETE = 'delete'
     MOVE = 'move'
-    IGNORE = 'ignore'
 
 
 def project_version() -> str:
@@ -198,7 +198,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # The seq of the last event the page already has (see update_group_list). Reset it if the processor is replaced
         self._page_seq = 0
         self.processor = None
+        # MARK (and KEEP) states of files. Ignored files are in self.ignored instead, which is saved between runs
         self.file_states = {}
+        self.ignored = IgnoredImages()
         self._threadpool = QtCore.QThreadPool()
 
         self.recycle = True
@@ -356,13 +358,9 @@ class MainWindow(QtWidgets.QMainWindow):
         run_move.triggered.connect(self.on_move)
         run_delete = QtGui.QAction("Delete", self)
         run_delete.triggered.connect(self.on_delete)
-        run_ignore = QtGui.QAction("Save ignored pictures", self)
-        run_ignore.triggered.connect(self.on_ignore)
-
         actions_menu = menu.addMenu("&Actions")
         actions_menu.addAction(run_move)
         actions_menu.addAction(run_delete)
-        actions_menu.addAction(run_ignore)
         # endregion
 
         # region Options menu
@@ -374,6 +372,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # TODO: I'm not sure what these two do... I'm willing to add them if someone needs them but I don't.
         # ... = QtGui.QAction("Between folders only", self)
         # ... = QtGui.QAction("Loosen filter automatically", self)
+
+        # Groups whose images are all ignored are hidden, unless this is checked (to un-ignore them)
+        self.show_ignored_option = QtGui.QAction("Show fully ignored groups", self, checkable=True)
+        self.show_ignored_option.triggered.connect(self.change_group_filters)
 
         # Each option that hides groups turns on a group filter, see group_filters
         self._group_filter_options = []  # (option, its group filter)
@@ -393,6 +395,7 @@ class MainWindow(QtWidgets.QMainWindow):
         options_menu.addSeparator()
         for option, _ in self._group_filter_options:
             options_menu.addAction(option)
+        options_menu.addAction(self.show_ignored_option)
         options_menu.addSeparator()
         options_menu.addAction(option_recycle)
         # endregion
@@ -417,13 +420,10 @@ class MainWindow(QtWidgets.QMainWindow):
         move_btn.pressed.connect(self.on_move)
         delete_btn = QtWidgets.QPushButton("Delete")
         delete_btn.pressed.connect(self.on_delete)
-        save_ignored_btn = QtWidgets.QPushButton("Save ignored")
-        save_ignored_btn.pressed.connect(self.on_ignore)
 
         actions = QtWidgets.QVBoxLayout()
         actions.addWidget(move_btn)
         actions.addWidget(delete_btn)
-        actions.addWidget(save_ignored_btn)
 
         actions_box = QtWidgets.QGroupBox("Actions")
         actions_box.setLayout(actions)
@@ -974,10 +974,6 @@ class MainWindow(QtWidgets.QMainWindow):
         """Delete button pressed, so delete every marked file"""
         self.process_file_states(FileAction.DELETE)
 
-    def on_ignore(self, *_):
-        """Save ignored button pressed, so take every ignored file out of the results"""
-        self.process_file_states(FileAction.IGNORE)
-
     def on_move(self, *_):
         """Move button pressed, so ask for a folder and move every marked file there"""
         self.process_file_states(FileAction.MOVE)
@@ -1080,8 +1076,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.recycle = checked
 
     def group_filters(self) -> list:
-        """The group filters of the options that hide groups (in the Options menu) which are checked"""
-        return [group_filter for option, group_filter in self._group_filter_options if option.isChecked()]
+        """
+        The group filters to use.
+
+        Returns:
+            list: Those of the options that hide groups (in the Options menu) which are checked, and the one that hides
+                groups whose images are all ignored (unless they're to be shown).
+        """
+        filters = [group_filter for option, group_filter in self._group_filter_options if option.isChecked()]
+        if not self.show_ignored_option.isChecked():
+            filters.append(self.ignored.keeps_group)
+
+        return filters
 
     def change_group_filters(self, *_):
         """An option that hides groups was checked or unchecked, so show the groups that the options don't hide"""
@@ -1261,15 +1267,37 @@ class MainWindow(QtWidgets.QMainWindow):
             duplicate, or that are hidden.
         Files in zips are read-only, so they are never marked:
             deleting or moving them would act on the zip itself, not the file inside it.
+        Ignoring a file is saved straight away (see IgnoredImages), and when every file in its group is ignored, the
+            group is hidden straight away. Use mark_paths for several files, which saves and hides them in one go.
         """
-        if state.state == SelectionState.MARK:
-            if path.is_zip:
-                return
+        self._set_file_states([path], state)
 
-            if not self._has_duplicate(path):
-                return
+    def _set_file_states(self, paths: Iterable[ZipPath], state: SelectionValue):
+        """Set the state of several files, see set_file_state"""
+        ignore, unignore = [], []
+        for path in paths:
+            if state.state == SelectionState.IGNORE:
+                self.file_states.pop(path, None)
+                ignore.append(path)
+                continue
 
-        self.file_states[path] = state
+            if state.state == SelectionState.MARK and (path.is_zip or not self._has_duplicate(path)):
+                continue
+
+            self.file_states[path] = state
+            if path in self.ignored:
+                unignore.append(path)
+
+        self.ignored.add(ignore)
+        self.ignored.discard(unignore)
+        if self.processor and (ignore or unignore) and not self.show_ignored_option.isChecked():
+            # Groups that are all ignored now are hidden (and ones that aren't anymore are shown)
+            before = len(self.processor.matches)
+            self.processor.recheck_groups(ignore + unignore)
+            if len(self.processor.matches) != before:
+                self._drop_marks_without_duplicates()
+                self.update_group_list()
+                self.update_labels()
 
     def _drop_marks_without_duplicates(self):
         """
@@ -1299,10 +1327,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         with self.processor.paused():
-            for path in paths:
-                self.set_file_state(path, state)
+            paths = list(paths)
 
-            self.update_selection_states()
+        self._set_file_states(paths, state)
+        self.update_selection_states()
 
     def mark_group(self, path, selection: SelectionValue):
         """Mark all files in a group with path as a particular state"""
@@ -1457,6 +1485,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _forget(self, path: ZipPath):
         """Take a file that was moved or deleted out of the results, along with any marking and preview it had"""
         self.file_states.pop(path, None)
+        self.ignored.discard([path])
         self.image_view_area.forget(path)
         with self.processor.paused():
             if path in self.processor._reverse_hashes:
@@ -1512,6 +1541,8 @@ class MainWindow(QtWidgets.QMainWindow):
         for group in self.duplicate_group_list._rows:
             for tile in group.tiles():
                 set_state = selections.get(tile.path)
+                if tile.path in self.ignored:
+                    set_state = SelectionValues.IGNORE
                 if set_state:
                     tile.silent_set_state(set_state)
 
@@ -1726,18 +1757,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def process_file_states(self, action: "FileAction"):
         """
-        Do an action to every file marked for it: Delete and Move act on MARK files, and Ignore on IGNORE ones.
+        Do an action (Delete or Move) to every MARK file.
 
         Move asks for the folder first. Moved files never replace anything (see move_file).
         """
         if not self.processor:
             return
 
-        wanted = SelectionState.IGNORE if action == FileAction.IGNORE else SelectionState.MARK
-        to_process = [path for path, state in self.file_states.items() if state.state == wanted]
+        to_process = [path for path, state in self.file_states.items() if state.state == SelectionState.MARK]
         if not to_process:
-            marked = "ignored" if wanted == SelectionState.IGNORE else "marked"
-            QtWidgets.QMessageBox.information(self, "Nothing to do", f"No files are {marked}.")
+            QtWidgets.QMessageBox.information(self, "Nothing to do", "No files are marked.")
             return
 
         folder = None
@@ -1755,7 +1784,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         file_size_deleted = 0
         file_count_deleted = 0
-        file_count_ignored = 0
         file_count_moved = 0
         file_count_renamed = 0
         processed_files = set()
@@ -1766,14 +1794,14 @@ class MainWindow(QtWidgets.QMainWindow):
             # One paused() block for every file, so the processor renumbers its groups once, not once per file
             with self.processor.paused():
                 for file in to_process:
-                    if file.is_zip and action != FileAction.IGNORE:
+                    if file.is_zip:
                         # set_file_state never allows this, but acting on file.path_obj would delete or move the WHOLE
                         #   zip
                         logger.warning("Refusing to %s %s, files in zips are read-only", action.value, file)
                         processed_files.add(file)
                         continue
 
-                    if file not in self.processor._reverse_hashes and action != FileAction.IGNORE:
+                    if file not in self.processor._reverse_hashes:
                         # Its folder was removed from the scan after it was marked, so leave the file alone
                         logger.info("Skipping %s, it is no longer part of the scan", file)
                         skipped_files.append(file)
@@ -1789,9 +1817,6 @@ class MainWindow(QtWidgets.QMainWindow):
                                 logger.info("File already deleted: %s", file)
                             self.processor.remove(file)
                             self.image_view_area.forget(file)
-                        elif action == FileAction.IGNORE:
-                            self.processor.ignore(file)
-                            file_count_ignored += 1
                         else:  # FileAction.MOVE
                             destination = self.move_file(file.path_obj, folder)
                             file_count_renamed += destination.name != file.path_obj.name
@@ -1831,9 +1856,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if file_count_deleted:
             popup_text += f"Deleted {file_count_deleted} files for a savings of {human_bytes(file_size_deleted)}.\n"
-
-        if file_count_ignored:
-            popup_text += f"Removed {file_count_ignored} files from matching.\n"
 
         if file_count_moved:
             popup_text += f"Moved {file_count_moved} file(s) to {folder}.\n"

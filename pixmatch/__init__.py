@@ -1006,6 +1006,22 @@ class ImageMatcher:
         insort(self._unmatched, match_i)
         self.duplicate_images -= len(group.matches)
 
+    def recheck_groups(self, paths: Iterable[ZipPath]):
+        """
+        Check again whether these images' groups are matches, after something a group filter looks at changed for
+            them, like the user ignoring them (see IgnoredImages.keeps_group).
+        """
+        with self.paused():
+            groups = {}
+            for path in paths:
+                hash_ = self._reverse_hashes.get(path)
+                if hash_ is not None:
+                    group = self._hashes[hash_]
+                    groups[id(group)] = group
+
+            for group in groups.values():
+                self._update_match(group)
+
     def _update_match(self, group: ImageMatch):
         """Make a group a match or stop it being one, as _counts_as_match decides, after its images changed"""
         if self._counts_as_match(group):
