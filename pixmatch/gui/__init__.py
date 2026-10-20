@@ -39,10 +39,6 @@ Image.MAX_IMAGE_PIXELS = None
 
 ICON_PATH = Path(__file__).resolve().parent / 'pixmatch.ico'
 
-# With this many images loaded, ticking Tilted copies warns that regrouping will be slow. With 260k images, regrouping
-#   with it on took ~14 minutes, and ~30s with 60k (with it off, a few seconds at any strength)
-TILTED_WARNING_IMAGES = 50_000
-
 # The options that hide groups, as they're named in the Options menu, and the group filter each one turns on
 #   (see ImageMatcher.set_group_filters)
 GROUP_FILTER_OPTIONS = {
@@ -561,11 +557,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.rotation_chkbx.setToolTip(
             "Also match copies turned by a few degrees (up to about 12), like a crooked scan\n"
             "or a re-photographed print. Copies turned 90 or 180 degrees, and mirror images,\n"
-            "are always matched.\n"
-            "This is slower: regrouping many images can take several minutes.",
+            "are always matched.",
         )
         self.rotation_chkbx.toggled.connect(self.schedule_regroup)
-        self.rotation_chkbx.clicked.connect(self.on_rotation_clicked)
         filter_checkboxes = QtWidgets.QHBoxLayout()
         filter_checkboxes.setContentsMargins(NO_MARGIN)
         filter_checkboxes.addWidget(self.hash_match_chkbx)
@@ -698,32 +692,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_hash_match_toggled(self, checked: bool):  # ruff: ignore[boolean-type-hint-positional-argument]
         """SHA-256 hashes only match identical files, so they can't find turned copies"""
         self.rotation_chkbx.setEnabled(not checked and self.precision_slider.isEnabled())
-        self.schedule_regroup()
-
-    def on_rotation_clicked(self, checked: bool):  # ruff: ignore[boolean-type-hint-positional-argument]
-        """Tilted copies was ticked or unticked: with many images loaded, say that regrouping with it is slow"""
-        loaded = self.processor.processed_images if self.processor else 0
-        if (not checked or loaded < TILTED_WARNING_IMAGES
-                or self._settings.value("warnings/hide_tilted_slow", defaultValue=False, type=bool)):
-            return
-
-        # The regroup waits until the message is closed (toggled has already scheduled it)
-        self._regroup_timer.stop()
-        dlg = QtWidgets.QMessageBox(self)
-        dlg.setIcon(QtWidgets.QMessageBox.Icon.Information)
-        dlg.setWindowTitle("Tilted copies")
-        dlg.setText(
-            f"Matching tilted copies is slow with {loaded:,} images loaded: regrouping can take several minutes "
-            "each time you move the strength slider.\n\n"
-            "You can untick Tilted copies at any time to make regrouping fast again.",
-        )
-        # Kept here: PySide loses track of it, so dlg.checkBox() can't be read back
-        dont_show = QtWidgets.QCheckBox("Don't show this again")
-        dlg.setCheckBox(dont_show)
-        dlg.exec()
-        if dont_show.isChecked():
-            self._settings.setValue("warnings/hide_tilted_slow", True)  # ruff: ignore[boolean-positional-value-in-call]
-
         self.schedule_regroup()
 
     def rotation_wanted(self) -> bool:
