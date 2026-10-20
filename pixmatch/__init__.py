@@ -453,41 +453,30 @@ class CentreIndex(HammingIndex):
 CENTRE_RADIUS = 4
 
 
-def find_neighbours(images: Sequence[tuple[int, ...]], start: int = 0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _close_pairs(queries: np.ndarray, stored: np.ndarray, radius: int,
+                 keep: Callable[[np.ndarray, np.ndarray, np.ndarray], np.ndarray],
+                 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Find each image's neighbours: the initial hashes of the images before it that are within NEIGHBOUR_RADIUS of it.
-
-    How far an image is from an initial hash is the fewest bits that any of its hashes differ from it by, just as
-        _find_group measures it from a group's key (which is the initial hash of the group's first image). So when
-        regrouping, the groups an image can join are exactly its neighbours that are group keys by then, within the
-        radius. And as group keys are only ever images that came before, nothing after an image is needed.
-    This is HammingIndex's search, with every image at once in numpy: the hashes of the images are the stored ones,
-        and each distinct initial hash is looked up once. With 260k images, that took ~7s (and ~230MB more while it ran)
-        where looking each image up in a HammingIndex at this radius took 3 minutes.
+    Find every query and stored hash within radius bits of each other: HammingIndex's search, with every query at once
+        in numpy. Each block of queries looks up every value within its chunk's limit in tables of the stored hashes.
 
     Args:
-        images (Sequence[tuple[int, ...]]): Every image's hashes, initial hash first, in the order they're matched in.
-        start (int): Only find the neighbours of images[start:]. The images before it are still neighbours.
+        queries (np.ndarray): The hashes to look up (uint64).
+        stored (np.ndarray): The hashes to find (uint64).
+        radius (int): The most bits a pair can differ by.
+        keep (Callable): Given the (query_i, stored_i, distances) of the pairs a block found within the radius, returns
+            the positions of the ones to keep. Dropping pairs here, rather than afterwards, keeps the memory down.
 
     Returns:
-        (indptr, hashes, distances): Image images[start + i]'s neighbours are hashes[indptr[i]:indptr[i + 1]], each
-            with how many bits it is from the image in distances, closest first (then lowest hash first, the order
-            _find_group picks in).
+        (query_i, stored_i, distances): The kept pairs, as positions in queries and stored. A pair is found through
+            every chunk that brings it within reach, so it can be in these more than once.
     """
-    if start >= len(images):
-        return np.zeros(1, dtype=np.int64), np.zeros(0, dtype=np.uint64), np.zeros(0, dtype=np.uint8)
-
-    index = HammingIndex(NEIGHBOUR_RADIUS)
-    owners = np.repeat(np.arange(start, len(images), dtype=np.int32), [len(hashes) for hashes in images[start:]])
-    stored = np.fromiter((hash_ for hashes in images[start:] for hash_ in hashes), dtype=np.uint64, count=len(owners))
-    initial = np.fromiter((hashes[0] for hashes in images), dtype=np.uint64, count=len(images))
-    # Each distinct initial hash, with the first image that has it: only the images after that one are its neighbours
-    queries, first = np.unique(initial, return_index=True)
-    first = first.astype(np.int32)
+    if not len(queries):
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.uint8)
 
     def search_block(block_start: int, chunk: tuple[int, int, np.ndarray], tables: tuple[np.ndarray, ...],
                      ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """The (image, query, distance) of every neighbour that a block of queries finds through one chunk"""
+        """The (query, stored, distance) of every kept pair that a block of queries finds through one chunk"""
         shift, mask, flips = chunk
         counts, starts, by_chunk = tables
         block = queries[block_start:block_start + NEIGHBOUR_BLOCK]
@@ -501,16 +490,15 @@ def find_neighbours(images: Sequence[tuple[int, ...]], start: int = 0) -> tuple[
         query_i = np.repeat((hits // len(flips) + block_start).astype(np.int32), stored_n)
 
         distances = np.bitwise_count(queries[query_i] ^ stored[positions])
-        close = (distances <= NEIGHBOUR_RADIUS).nonzero()[0]
-        image_i = owners[positions[close]]
-        query_i = query_i[close]
-        earlier = (first[query_i] < image_i).nonzero()[0]
-        return image_i[earlier], query_i[earlier], distances[close][earlier]
+        close = (distances <= radius).nonzero()[0]
+        query_i, positions, distances = query_i[close], positions[close], distances[close]
+        kept = keep(query_i, positions, distances)
+        return query_i[kept], positions[kept], distances[kept]
 
     # numpy lets go of the GIL for the big array operations, so the blocks run side by side
     found = []
     with ThreadPoolExecutor(min(8, os.cpu_count() or 1)) as pool:
-        for shift, mask, flips in index._chunks:
+        for shift, mask, flips in HammingIndex(radius)._chunks:
             values = ((stored >> np.uint64(shift)) & np.uint64(mask)).astype(np.int32)
             counts = np.bincount(values, minlength=mask + 1).astype(np.int32)
             tables = (counts, (np.cumsum(counts) - counts).astype(np.int32), np.argsort(values).astype(np.int32))
@@ -518,22 +506,149 @@ def find_neighbours(images: Sequence[tuple[int, ...]], start: int = 0) -> tuple[
             blocks = range(0, len(queries), NEIGHBOUR_BLOCK)
             found += pool.map(partial(search_block, chunk=chunk, tables=tables), blocks)
 
-    image_i = np.concatenate([image_i for image_i, _, _ in found], dtype=np.int64)
-    query_i = np.concatenate([query_i for _, query_i, _ in found], dtype=np.int64)
-    distances = np.concatenate([distances for _, _, distances in found], dtype=np.uint8)
+    return (np.concatenate([query_i for query_i, _, _ in found], dtype=np.int64),
+            np.concatenate([stored_i for _, stored_i, _ in found], dtype=np.int64),
+            np.concatenate([distances for _, _, distances in found], dtype=np.uint8))
 
-    # A neighbour is found through every chunk and hash that brings it within reach: keep its closest
-    order = np.lexsort((distances, query_i, image_i))
-    image_i, query_i, distances = image_i[order], query_i[order], distances[order]
+
+def _closest_lists(image_i: np.ndarray, found: np.ndarray, distances: np.ndarray, images: int, start: int,
+                   ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Keep the closest of each image's pairs with each thing it found, and list them by image, closest first (then
+        lowest found first).
+
+    Args:
+        image_i (np.ndarray): The image of each pair, from start up to images.
+        found (np.ndarray): What each pair found.
+        distances (np.ndarray): How far apart each pair is.
+        images (int): How many images there are.
+        start (int): The first image that pairs can be for.
+
+    Returns:
+        (indptr, found, distances): Image start + i's are found[indptr[i]:indptr[i + 1]], and how far each is.
+    """
+    order = np.lexsort((distances, found, image_i))
+    image_i, found, distances = image_i[order], found[order], distances[order]
     closest = np.ones(len(image_i), dtype=bool)
-    closest[1:] = (image_i[1:] != image_i[:-1]) | (query_i[1:] != query_i[:-1])
-    image_i, query_i, distances = image_i[closest], query_i[closest], distances[closest]
+    closest[1:] = (image_i[1:] != image_i[:-1]) | (found[1:] != found[:-1])
+    image_i, found, distances = image_i[closest], found[closest], distances[closest]
 
-    # Closest first, then lowest hash first (queries is sorted, so its order is the hashes' order)
-    order = np.lexsort((query_i, distances, image_i))
-    indptr = np.zeros(len(images) - start + 1, dtype=np.int64)
-    np.cumsum(np.bincount(image_i - start, minlength=len(images) - start), out=indptr[1:])
-    return indptr, queries[query_i[order]], distances[order]
+    order = np.lexsort((found, distances, image_i))
+    indptr = np.zeros(images - start + 1, dtype=np.int64)
+    np.cumsum(np.bincount(image_i - start, minlength=images - start), out=indptr[1:])
+    return indptr, found[order], distances[order]
+
+
+def find_neighbours(images: Sequence[tuple[int, ...]], start: int = 0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Find each image's neighbours: the initial hashes of the images before it that are within NEIGHBOUR_RADIUS of it.
+
+    How far an image is from an initial hash is the fewest bits that any of its hashes differ from it by, just as
+        _find_group measures it from a group's key (which is the initial hash of the group's first image). So when
+        regrouping, the groups an image can join are exactly its neighbours that are group keys by then, within the
+        radius. And as group keys are only ever images that came before, nothing after an image is needed.
+    This is HammingIndex's search, with every image at once in numpy (see _close_pairs): the hashes of the images are
+        the stored ones, and each distinct initial hash is looked up once. With 260k images, that took ~7s (and ~230MB
+        more while it ran) where looking each image up in a HammingIndex at this radius took 3 minutes.
+
+    Args:
+        images (Sequence[tuple[int, ...]]): Every image's hashes, initial hash first, in the order they're matched in.
+        start (int): Only find the neighbours of images[start:]. The images before it are still neighbours.
+
+    Returns:
+        (indptr, hashes, distances): Image images[start + i]'s neighbours are hashes[indptr[i]:indptr[i + 1]], each
+            with how many bits it is from the image in distances, closest first (then lowest hash first, the order
+            _find_group picks in).
+    """
+    if start >= len(images):
+        return np.zeros(1, dtype=np.int64), np.zeros(0, dtype=np.uint64), np.zeros(0, dtype=np.uint8)
+
+    owners = np.repeat(np.arange(start, len(images), dtype=np.int32), [len(hashes) for hashes in images[start:]])
+    stored = np.fromiter((hash_ for hashes in images[start:] for hash_ in hashes), dtype=np.uint64, count=len(owners))
+    initial = np.fromiter((hashes[0] for hashes in images), dtype=np.uint64, count=len(images))
+    # Each distinct initial hash, with the first image that has it: only the images after that one are its neighbours
+    queries, first = np.unique(initial, return_index=True)
+    first = first.astype(np.int32)
+
+    def keep(query_i: np.ndarray, stored_i: np.ndarray, _: np.ndarray) -> np.ndarray:
+        """The pairs with an image after the first that has the query"""
+        return (first[query_i] < owners[stored_i]).nonzero()[0]
+
+    query_i, stored_i, distances = _close_pairs(queries, stored, NEIGHBOUR_RADIUS, keep)
+
+    # A neighbour is found through every chunk and hash that brings it within reach: keep its closest. queries is
+    #   sorted, so lowest query_i first is lowest hash first
+    indptr, query_i, distances = _closest_lists(owners[stored_i], query_i, distances, len(images), start)
+    return indptr, queries[query_i], distances
+
+
+def find_turned_neighbours(centres: Sequence[bytes | None], start: int = 0,
+                           ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Find each image's turned neighbours: the images before it whose centre hashes are within CENTRE_RADIUS of one of
+        its turned queries, and closer to it than its own centre hash is (turning explains them better than not).
+
+    That is what _find_group looks up in _centre_index for an image that matched nothing as a whole. So when regrouping
+        with rotation on, an image's turned neighbours that are still loaded are exactly what that would find, as every
+        image before it has been added by then. This finds them for every image at once in numpy, see _close_pairs.
+        With 260k images, that took ~4s, where looking each image up in _centre_index added 2.5-4 minutes to every
+        regroup.
+
+    Args:
+        centres (Sequence[bytes | None]): Every image's centre hashes, in the order they're matched in.
+        start (int): Only find the turned neighbours of centres[start:]. The images before it can still be found.
+
+    Returns:
+        (indptr, images, distances): Image start + i's turned neighbours are images[indptr[i]:indptr[i + 1]], as
+            positions in centres, each with the fewest bits any of the image's turned queries is from it in distances.
+    """
+    with_centre = np.fromiter((centre is not None for centre in centres), dtype=bool, count=len(centres)).nonzero()[0]
+    packed = np.frombuffer(b"".join(centre for centre in centres if centre is not None), dtype=">u8")
+    packed = packed.reshape(-1, phash.CENTRE_HASHES).astype(np.uint64)  # A row for each image with centre hashes
+    first_row = int(np.searchsorted(with_centre, start))
+
+    # Every image is found by its centre hash and its mirror's, and finds others with its turned queries
+    stored = packed[:, [0, -1]].ravel()
+    stored_row = np.repeat(np.arange(len(packed)), 2)
+    queries = packed[first_row:, 1:-1].ravel()
+    query_row = np.repeat(np.arange(first_row, len(packed)), packed.shape[1] - 2)
+    as_is = packed[:, 0]
+
+    def keep(query_i: np.ndarray, stored_i: np.ndarray, distances: np.ndarray) -> np.ndarray:
+        """The pairs with an image before the query's, that turning explains better than not turning"""
+        rows, found_rows = query_row[query_i], stored_row[stored_i]
+        not_turned = np.minimum(np.bitwise_count(as_is[rows] ^ packed[found_rows, 0]),
+                                np.bitwise_count(as_is[rows] ^ packed[found_rows, -1]))
+        return ((found_rows < rows) & (distances < not_turned)).nonzero()[0]
+
+    query_i, stored_i, distances = _close_pairs(queries, stored, CENTRE_RADIUS, keep)
+    return _closest_lists(with_centre[query_row[query_i]], with_centre[stored_row[stored_i]], distances,
+                          len(centres), start)
+
+
+def _extend_lists(lists: tuple | None, images: list[tuple[ZipPath, tuple]],
+                  find: Callable[[int], tuple[np.ndarray, np.ndarray, np.ndarray]]) -> tuple:
+    """
+    Add the lists of the images that don't have them yet to ImageMatcher's _neighbours or _turned_neighbours: all of
+        them the first time, then the ones added since. Those were added last, so they're the last in the order.
+
+    Args:
+        lists (tuple | None): (the orders of the images they're for, indptr, found, distances), or None for none yet.
+        images (list[tuple[ZipPath, tuple]]): Every loaded image's _image_hashes item, sorted by their order.
+        find (Callable): Finds the (indptr, found, distances) of images[start:], given start.
+
+    Returns:
+        tuple: The lists, with every image's.
+    """
+    orders, indptr, found, distances = lists or ([], np.zeros(1, dtype=np.int64), None, None)
+    start = bisect_right([order for _, (order, _, _) in images], orders[-1]) if orders else 0
+    if start < len(images):
+        new_indptr, new_found, new_distances = find(start)
+        orders = orders + [order for _, (order, _, _) in images[start:]]
+        indptr = np.concatenate((indptr, new_indptr[1:] + indptr[-1]))
+        found = new_found if found is None else np.concatenate((found, new_found))
+        distances = new_distances if distances is None else np.concatenate((distances, new_distances))
+    return orders, indptr, found, distances
 
 
 class ImageMatcher:
@@ -614,6 +729,11 @@ class ImageMatcher:
         self._centre_index = CentreIndex(CENTRE_RADIUS)
         self._centre_paths = {}  # Centre hash -> set of paths
         self._path_centres = {}  # Path -> its centre hashes (and its mirror's)
+        # Every image's turned neighbours (see find_turned_neighbours), so regrouping with rotation on doesn't have to
+        #   look each image's centre hashes up in _centre_index: (the orders of the images they're for, indptr, the
+        #   orders of the images they found, distances). Found and kept like _neighbours, by the regroups with
+        #   rotation on
+        self._turned_neighbours = None
 
         # Finds the hashes of _hashes that are close to an image's hashes. Not needed if they must be identical
         self._index = HammingIndex(self.radius) if self.radius and not exact_match else None
@@ -894,8 +1014,8 @@ class ImageMatcher:
         elif group.match_i is not None:
             self._unmatch(group)
 
-    def _find_group(self, hashes: set, centre: bytes | None = None,
-                    near: Sequence[int] | None = None) -> int | str | None:
+    def _find_group(self, hashes: set, centre: bytes | None = None, near: Sequence[int] | None = None,
+                    turned: Sequence[tuple[int, ZipPath]] | None = None) -> int | str | None:
         """
         Find the group an image belongs to.
 
@@ -905,6 +1025,8 @@ class ImageMatcher:
                 the image as a whole.
             near (Sequence[int] | None): The image's neighbours within the radius, closest first (see find_neighbours),
                 to pick the group from instead of looking the image up. The first that is a group key is the group.
+            turned (Sequence[tuple[int, ZipPath]] | None): The image's turned neighbours that are loaded, as (distance,
+                path) (see find_turned_neighbours), to pick from instead of looking its centre hashes up.
 
         Returns:
             int | str | None: The key in _hashes of the closest group, or None if no group is close enough.
@@ -935,9 +1057,13 @@ class ImageMatcher:
         # Nothing matched it as a whole, so is it a turned copy of a loaded image (or the other way around)?
         #   Only the turned queries are looked up, and an image only counts if turning explains the match better than
         #   not turning: an image whose middle matches as is (a recolored copy, say) is up to the strength to match.
-        as_is, *turned = phash.unpack_centre_hashes(centre)[1]
+        if turned is not None:
+            closest = min(((distance, self._reverse_hashes[path]) for distance, path in turned), default=None)
+            return None if closest is None else closest[1]
+
+        as_is, *queries = phash.unpack_centre_hashes(centre)[1]
         closest = None
-        for query in turned:
+        for query in queries:
             for found_centre, distance in self._centre_index.find(query).items():
                 for found_path in self._centre_paths[found_centre]:
                     key = self._reverse_hashes[found_path]
@@ -1076,7 +1202,8 @@ class ImageMatcher:
         return True
 
     def _add_image(self, path: ZipPath, initial_hash: int | str, hashes: set, centre: bytes | None = None, *,
-                   emit: bool = True, near: Sequence[int] | None = None):
+                   emit: bool = True, near: Sequence[int] | None = None,
+                   turned: Sequence[tuple[int, ZipPath]] | None = None):
         """
         Put an image in the group it matches, or in a group of its own if it matches none. The lock must be held.
 
@@ -1087,8 +1214,9 @@ class ImageMatcher:
             centre (bytes | None): The image's centre hashes, for matching turned copies.
             emit (bool): Send events for new groups and matches? Regrouping doesn't, the GUI redraws everything.
             near (Sequence[int] | None): The image's neighbours within the radius, see _find_group.
+            turned (Sequence[tuple[int, ZipPath]] | None): The image's turned neighbours, see _find_group.
         """
-        hash_ = self._find_group(hashes, centre, near)
+        hash_ = self._find_group(hashes, centre, near, turned)
         if hash_ is None:
             # This is a new image not matching any previous, so just add it to the hashmap and move on...
             #   Just use the initial orientation
@@ -1182,8 +1310,11 @@ class ImageMatcher:
             # Each image's neighbours within the radius, so it needn't be looked up in the index (which took minutes
             #   at the loosest strengths). Exact matches are quick to look up anyway
             nears = self._near_hashes(images) if self.radius else repeat(None, len(images))
-            for done, ((path, (_, hashes, centre)), near) in enumerate(zip(images, nears, strict=True), start=1):
-                self._add_image(path, hashes[0], set(hashes), centre, emit=False, near=near)
+            # And with rotation on, its turned neighbours (looking them up took minutes with 260k images)
+            turneds = self._turned_paths(images) if self.rotation else repeat(None, len(images))
+            for done, ((path, (_, hashes, centre)), near, turned) in enumerate(zip(images, nears, turneds, strict=True),
+                                                                              start=1):
+                self._add_image(path, hashes[0], set(hashes), centre, emit=False, near=near, turned=turned)
                 if progress and done % REGROUP_PROGRESS_EVERY == 0 and not progress(done, len(images)):
                     (self.strength, self.radius, self.rotation, matches, self.duplicate_images, self._hashes,
                      self._reverse_hashes, self._index, self._centre_index, self._centre_paths,
@@ -1209,17 +1340,9 @@ class ImageMatcher:
         if not images:
             return
 
-        # Find the neighbours of the images that don't have them yet: all of them the first time, then the ones added
-        #   since. Those were added last, so they're the last in the order
-        orders, indptr, near, distances = self._neighbours or ([], np.zeros(1, dtype=np.int64), None, None)
-        start = bisect_right([order for _, (order, _, _) in images], orders[-1]) if orders else 0
-        if start < len(images):
-            new_indptr, new_near, new_distances = find_neighbours([hashes for _, (_, hashes, _) in images], start)
-            orders = orders + [order for _, (order, _, _) in images[start:]]
-            indptr = np.concatenate((indptr, new_indptr[1:] + indptr[-1]))
-            near = new_near if near is None else np.concatenate((near, new_near))
-            distances = new_distances if distances is None else np.concatenate((distances, new_distances))
-            self._neighbours = (orders, indptr, near, distances)
+        self._neighbours = _extend_lists(self._neighbours, images, lambda start: find_neighbours(
+            [hashes for _, (_, hashes, _) in images], start))
+        orders, indptr, near, distances = self._neighbours
 
         # Each image's neighbours are sorted closest first, so the ones within the radius come first
         within = np.zeros(len(distances) + 1, dtype=np.int64)
@@ -1233,6 +1356,36 @@ class ImageMatcher:
             while orders[row] != order:
                 row += 1
             yield near[starts[row]:ends[row]].tolist() if starts[row] != ends[row] else []
+
+    def _turned_paths(self, images: list[tuple[ZipPath, tuple]]) -> Iterator[list[tuple[int, ZipPath]]]:
+        """
+        Yield each image's turned neighbours that are loaded (see find_turned_neighbours), as (distance, path).
+
+        Args:
+            images (list[tuple[ZipPath, tuple]]): Every loaded image's _image_hashes item, sorted by their order.
+
+        Yields:
+            list[tuple[int, ZipPath]]: The next image's turned neighbours.
+        """
+        if not images:
+            return
+
+        def find(start: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            """The turned neighbours of images[start:], as the orders of the images they found"""
+            indptr, found, distances = find_turned_neighbours([centre for _, (_, _, centre) in images], start)
+            return indptr, np.array([order for _, (order, _, _) in images], dtype=np.int64)[found], distances
+
+        self._turned_neighbours = _extend_lists(self._turned_neighbours, images, find)
+        orders, indptr, found, distances = self._turned_neighbours
+        indptr, found, distances = indptr.tolist(), found.tolist(), distances.tolist()
+
+        # The images that are gone since have turned neighbours too, so skip theirs, and skip the ones they found
+        paths = {order: path for path, (order, _, _) in images}
+        row = 0
+        for _, (order, _, _) in images:
+            while orders[row] != order:
+                row += 1
+            yield [(distances[i], paths[found[i]]) for i in range(indptr[row], indptr[row + 1]) if found[i] in paths]
 
     def _process_image_error_callback(self, e):
         """Log an image that couldn't be hashed, and count it as processed"""
