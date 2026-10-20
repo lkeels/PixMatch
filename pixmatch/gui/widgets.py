@@ -1328,6 +1328,12 @@ class DuplicateGroupList(QtWidgets.QWidget):
 # endregion
 
 
+# What folders being dragged carry: from the folder tree (their paths, one per line), and within the folder list
+#   (nothing, the list knows which are selected). Neither is a file type, so nothing outside pixmatch accepts them.
+FOLDERS_MIME = "application/x-pixmatch-folders"
+LISTED_MIME = "application/x-pixmatch-listed-folders"
+
+
 class _FolderIconProvider(QtWidgets.QFileIconProvider):
     """
     Icons for the folder tree, without working out a type for every file.
@@ -1573,3 +1579,140 @@ class DirFileSystemModel(QtWidgets.QFileSystemModel):
         self._stale.clear()
         self._pending.clear()
         self._parents.clear()
+
+    def mimeTypes(self) -> list[str]:
+        """Folders dragged from the tree are only for the folder list, see mimeData"""
+        return [FOLDERS_MIME]
+
+    def mimeData(self, indexes: Sequence[QtCore.QModelIndex]) -> QtCore.QMimeData:
+        """
+        The folders being dragged, as paths only the folder list understands.
+
+        Qt would drag them as files, which Explorer accepts: dropping a folder there would copy or move the real folder.
+
+        Returns:
+            QtCore.QMimeData: The folders' paths, one per line, as FOLDERS_MIME.
+        """
+        paths = dict.fromkeys(self.filePath(index) for index in indexes if index.column() == 0)
+        mime = QtCore.QMimeData()
+        mime.setData(FOLDERS_MIME, "\n".join(paths).encode())
+        return mime
+
+    def supportedDragActions(self) -> QtCore.Qt.DropAction:
+        """Dragging a folder only ever adds it to the folder list, it never moves it"""
+        return QtCore.Qt.DropAction.CopyAction
+
+
+def same_folder(path: str) -> str:
+    """A folder's path, normalised so the same folder written two ways (like C:/a and c:/A/) compares equal"""
+    return os.path.normcase(os.path.normpath(path))
+
+
+class FolderListWidget(QtWidgets.QListWidget):
+    """
+    The folders to scan.
+
+    Folders can be dragged in from the folder tree or Explorer, dragged up and down to reorder them, and dragged out
+        of the list (anywhere else in the window) to remove them. The window does the adding and removing, so it can
+        tell a scan in progress: see foldersDropped and foldersDraggedOut.
+    Drops from Explorer are always taken as copies: accepting a move would let Explorer delete what it thinks moved.
+    """
+
+    foldersDropped = QtCore.Signal(list, int)  # Folder paths, and the row to insert them at
+    foldersDraggedOut = QtCore.Signal(list)  # The QListWidgetItems dragged out of the list
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setDragDropMode(QtWidgets.QAbstractItemView.DragDropMode.DragDrop)
+        self.setDefaultDropAction(QtCore.Qt.DropAction.MoveAction)
+        self.setDropIndicatorShown(True)
+
+    def mimeTypes(self) -> list[str]:
+        """What can be dropped here, so Qt shows where it would go: listed folders, tree folders, and Explorer's"""
+        return [LISTED_MIME, FOLDERS_MIME, "text/uri-list"]
+
+    def startDrag(self, _supported_actions: QtCore.Qt.DropAction):
+        """Drag the selected folders, to reorder them here or remove them by dropping them elsewhere in the window"""
+        if not self.selectedItems():
+            return
+
+        mime = QtCore.QMimeData()
+        mime.setData(LISTED_MIME, b"")
+        drag = QtGui.QDrag(self)
+        drag.setMimeData(mime)
+        drag.exec(QtCore.Qt.DropAction.MoveAction)
+
+    def _dropped_folders(self, event: QtGui.QDropEvent) -> list[str] | None:
+        """The folders a drag from outside the list brings, or None if it isn't one this list takes"""
+        mime = event.mimeData()
+        if mime.hasFormat(FOLDERS_MIME):
+            return [path for path in bytes(mime.data(FOLDERS_MIME).data()).decode().split("\n") if path]
+
+        if mime.hasUrls():
+            folders = [url.toLocalFile() for url in mime.urls() if url.isLocalFile()]
+            return [folder for folder in folders if Path(folder).is_dir()] or None
+
+        return None
+
+    def _accept(self, event: QtGui.QDropEvent) -> bool:
+        """Accept a drag this list takes, as a move for its own folders and a copy for any other. Was it accepted?"""
+        if event.source() is self and event.mimeData().hasFormat(LISTED_MIME):
+            event.setDropAction(QtCore.Qt.DropAction.MoveAction)
+        elif self._dropped_folders(event):
+            event.setDropAction(QtCore.Qt.DropAction.CopyAction)
+        else:
+            event.ignore()
+            return False
+
+        event.accept()
+        return True
+
+    def dragEnterEvent(self, event: QtGui.QDragEnterEvent):
+        """Take the drag if it's folders"""
+        if self._accept(event):
+            super().dragEnterEvent(event)
+            self._accept(event)  # (Qt picks its own action)
+
+    def dragMoveEvent(self, event: QtGui.QDragMoveEvent):
+        """Show where the folders would go"""
+        if self._accept(event):
+            super().dragMoveEvent(event)
+            self._accept(event)
+
+    def _drop_row(self, pos: QtCore.QPoint) -> int:
+        """The row dropped folders go in at: before or after the folder under the cursor, or at the end"""
+        index = self.indexAt(pos)
+        if not index.isValid():
+            return self.count()
+
+        return index.row() + (pos.y() > self.visualRect(index).center().y())
+
+    def dropEvent(self, event: QtGui.QDropEvent):
+        """Move the list's own folders to where they were dropped, or ask for other folders to be added there"""
+        if not self._accept(event):
+            return
+
+        row = self._drop_row(event.position().toPoint())
+        if event.source() is not self:
+            self.foldersDropped.emit(self._dropped_folders(event), row)
+            return
+
+        items = sorted(self.selectedItems(), key=self.row)
+        row -= sum(self.row(item) < row for item in items)  # Taking them out moves the ones after them up
+        for item in items:
+            self.takeItem(self.row(item))
+
+        for offset, item in enumerate(items):
+            self.insertItem(row + offset, item)
+
+        self.select(items)
+
+    def select(self, items: Sequence[QtWidgets.QListWidgetItem]):
+        """Select these items (only), with the last as the current one"""
+        self.clearSelection()
+        for item in items:
+            item.setSelected(True)
+
+        if items:
+            self.setCurrentItem(items[-1], QtCore.QItemSelectionModel.SelectionFlag.NoUpdate)

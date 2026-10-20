@@ -18,13 +18,16 @@ from send2trash import send2trash
 from pixmatch import Finished, ImageMatcher, NewGroup, NewMatch, ZipPath, _is_under, has_image_outside_zips
 from pixmatch.gui.utils import MAX_SIZE_POLICY, NO_MARGIN
 from pixmatch.gui.widgets import (
+    LISTED_MIME,
     DirFileSystemModel,
     DuplicateGroupList,
+    FolderListWidget,
     ImageViewPane,
     SelectionState,
     SelectionValue,
     SelectionValues,
     TileAction,
+    same_folder,
 )
 from pixmatch.utils import human_bytes
 
@@ -630,6 +633,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.file_system_view.hideColumn(1)  # Size
         self.file_system_view.hideColumn(2)  # Type
         self.file_system_view.hideColumn(3)  # Date Modified
+        # Folders can be dragged to the folder list (several at once, with Ctrl or Shift), as well as added with >+
+        self.file_system_view.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.file_system_view.setDragDropMode(QtWidgets.QAbstractItemView.DragDropMode.DragOnly)
         file_view_splitter = QtWidgets.QHBoxLayout()
         file_view_splitter.setContentsMargins(NO_MARGIN)
         file_view_splitter.addWidget(self.file_system_view)
@@ -1500,7 +1506,11 @@ class MainWindow(QtWidgets.QMainWindow):
         file_path_io_controls.addWidget(file_path_out_control)
         # endregion
 
-        self.selected_file_path_display = QtWidgets.QListWidget()
+        self.selected_file_path_display = FolderListWidget()
+        self.selected_file_path_display.foldersDropped.connect(self.add_folders)
+        self.selected_file_path_display.foldersDraggedOut.connect(self.remove_folders)
+        # Folders dragged out of the list are removed when they're dropped anywhere else in the window
+        self.setAcceptDrops(True)
 
         file_path_controls = QtWidgets.QHBoxLayout()
         file_path_controls.setContentsMargins(NO_MARGIN)
@@ -1510,51 +1520,91 @@ class MainWindow(QtWidgets.QMainWindow):
         return file_path_controls
 
     def file_path_up_clicked(self, _):
-        """Move the selected directory up in the ordering"""
+        """Move the selected folders up in the ordering"""
         # TODO: If the path has already been loaded for processing in the processor, then this won't do much
-        for selected_index in self.selected_file_path_display.selectedIndexes():
-            row = selected_index.row()
-            if row == 0:
-                continue
-
-            item = self.selected_file_path_display.takeItem(row)
-            self.selected_file_path_display.insertItem(row - 1, item)
-            self.selected_file_path_display.setCurrentIndex(self.selected_file_path_display.indexFromItem(item))
+        self._move_selected_folders(-1)
 
     def file_path_down_clicked(self, _):
-        """Move the selected directory down in the ordering"""
-        # TODO: If the path has already been loaded for processing in the processor, then this won't do much
-        for selected_index in self.selected_file_path_display.selectedIndexes():
-            row = selected_index.row()
-            if row == self.selected_file_path_display.count() - 1:
+        """Move the selected folders down in the ordering"""
+        self._move_selected_folders(1)
+
+    def _move_selected_folders(self, step: int):
+        """Move the selected folders one row up (-1) or down (1), stopping at the top or bottom"""
+        view = self.selected_file_path_display
+        items = sorted(view.selectedItems(), key=view.row, reverse=step > 0)  # The one nearest the end it goes to first
+        blocked = -1 if step < 0 else view.count()  # A row they can't move into
+        for item in items:
+            row = view.row(item)
+            if row + step == blocked:
+                blocked = row  # Stuck, so the next one can't move into its row either
                 continue
 
-            item = self.selected_file_path_display.takeItem(row)
-            self.selected_file_path_display.insertItem(row + 1, item)
-            self.selected_file_path_display.setCurrentIndex(self.selected_file_path_display.indexFromItem(item))
+            view.takeItem(row)
+            view.insertItem(row + step, item)
+
+        view.select(items[::-1] if step > 0 else items)
 
     def file_path_in_clicked(self, _):
-        """Add the selected directory, and add to processing if processing has been started"""
-        selected_indexes = self.file_system_view.selectedIndexes()
-        for index in selected_indexes:
-            info = self.file_system_view.model().fileInfo(index)
-            target_path = info.filePath()
-            self.selected_file_path_display.addItem(target_path)
+        """Add the folders selected in the folder tree"""
+        model = self.file_system_view.model()
+        self.add_folders([model.fileInfo(index).filePath() for index in self.file_system_view.selectedIndexes()])
+
+    def file_path_out_clicked(self, _):
+        """Remove the selected folders"""
+        self.remove_folders(self.selected_file_path_display.selectedItems())
+
+    def add_folders(self, folders: list[str], row: int | None = None):
+        """
+        Add folders to the list (any already in it are skipped), and to a scan in progress.
+
+        Args:
+            folders (list[str]): The folders' paths.
+            row (int | None): Where to put them in the list, or None for the end.
+        """
+        view = self.selected_file_path_display
+        listed = {same_folder(folder) for folder in self.file_paths_selected()}
+        row = view.count() if row is None else row
+        for folder in folders:
+            if same_folder(folder) in listed:
+                continue
+
+            listed.add(same_folder(folder))
+            view.insertItem(row, folder)
+            row += 1
 
             # A scan that is in progress is told about the folder, even a paused one (it gets to the folder once it's
             #   resumed). With no scan in progress, the next one starts with every folder listed
             if self.processor and not self.processor.is_finished():
-                self.processor.add_path(target_path)
+                self.processor.add_path(folder)
 
-    def file_path_out_clicked(self, _):
-        """Move the selected directory out of processing"""
-        for selected_index in self.selected_file_path_display.selectedIndexes():
-            selected_item = self.selected_file_path_display.takeItem(selected_index.row())
-
+    def remove_folders(self, items: list[QtWidgets.QListWidgetItem]):
+        """Remove folders from the list, and their images from the scan"""
+        view = self.selected_file_path_display
+        for item in items:
+            view.takeItem(view.row(item))
             if self.processor:
-                self.processor.remove_path(selected_item.text())
-                self.update_group_list()
-                self.update_labels()
+                self.processor.remove_path(item.text())
+
+        if items and self.processor:
+            self.update_group_list()
+            self.update_labels()
+
+    def dragEnterEvent(self, event: QtGui.QDragEnterEvent):
+        """Folders dragged out of the folder list can be dropped anywhere else in the window, to remove them"""
+        if event.source() is self.selected_file_path_display and event.mimeData().hasFormat(LISTED_MIME):
+            event.setDropAction(QtCore.Qt.DropAction.MoveAction)
+            event.accept()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QtGui.QDropEvent):
+        """Folders dragged out of the folder list were dropped somewhere else in the window: remove them"""
+        if event.source() is self.selected_file_path_display and event.mimeData().hasFormat(LISTED_MIME):
+            event.setDropAction(QtCore.Qt.DropAction.MoveAction)
+            event.accept()
+            self.remove_folders(self.selected_file_path_display.selectedItems())
+        else:
+            event.ignore()
 
     def file_paths_selected(self):
         """Get the file paths selected in the selected file path display"""
