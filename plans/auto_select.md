@@ -1,6 +1,6 @@
 # Auto-select
 
-Status: **designed**, nothing built yet. The Auto-select menu item and button exist but are disabled.
+Status: **building**. Step 1 (measuring quality) is done. The Auto-select menu item and button exist but are disabled.
 
 ## Goal
 
@@ -85,7 +85,10 @@ Settled 2026-10-20.
 ## Build steps
 
 1. Measure quality during the scan (resolution and file size are free; sharpness and colour from the image the scan
-   already reads), so Auto-select doesn't reopen 260k files.
+   already reads), so Auto-select doesn't reopen 260k files. **Done** (b4e8c78): `ImageQuality`, from
+   `ImageMatcher.quality(path)`. Hashes unchanged; costs ~1ms an image. In 800 library images: 80 grey
+   (colourfulness < 2), 13 tinted (colour variety < 1.5), 707 colour, 24 between tinted and colour (variety 1.5-3) to
+   look at when tuning.
 2. The decision rules, tested on made-up groups covering every case above.
 3. MOVE TO: the state, its banner and hover, Apply carrying out deletes and replacements, and the right-click
    "Replace...".
