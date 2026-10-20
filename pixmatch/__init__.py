@@ -117,6 +117,124 @@ BLAS_THREADS_VAR = "OPENBLAS_NUM_THREADS"
 #   the image: like a TIFF's other pages, or the preview that many cameras add to their JPEGs (which open as MPO)
 ANIMATION_FORMATS = {"GIF", "PNG", "WEBP"}
 
+# JPEG formats (MPO is a JPEG with a camera's preview added), which can be decoded at a reduced size (see draft)
+JPEG_FORMATS = {"JPEG", "MPO"}
+
+# Colour is measured on a COLOUR_SAMPLE x COLOUR_SAMPLE copy of the image (see ImageQuality)
+COLOUR_SAMPLE = 64
+
+# How far a pixel's colour is from grey (its chroma, the distance of its Cb and Cr from 128) for it to count as
+#   coloured. JPEG compression gives grey pictures a little chroma noise
+COLOURED_CHROMA = 6
+
+# libjpeg's standard luminance quantization table, which encoders scale by their quality setting (see _jpeg_quality)
+_STANDARD_LUMA_TABLE_SUM = 3474
+
+
+@dataclass(frozen=True)
+class ImageQuality:
+    """
+    Measurements of an image, taken while it's hashed, for choosing which copy of a picture to keep (Auto-select).
+
+    They're kept raw, so how they're weighed can change without scanning again.
+
+    Attributes:
+        width (int), height (int): The image's size as it's displayed (turned by its EXIF orientation).
+        file_size (int): Bytes on disk (for an image in a zip, its uncompressed size).
+        format (str): Pillow's name for the format, like "JPEG", "PNG" or "WEBP". Empty if it wasn't opened.
+        jpeg_quality (int | None): The quality a JPEG was saved at (1-100), estimated from its quantization table.
+        animated (bool): Whether it's an animation.
+        colourfulness (float): How far its pixels are from grey on average (mean chroma, 0 for a grey picture).
+        coloured (float): The fraction of its pixels that are clearly coloured (chroma over COLOURED_CHROMA).
+        colour_variety (float): How much the colour varies among pixels of the same brightness (mean chroma away
+            from the average colour at each brightness). Near 0 for a sepia or other tinted black and white picture,
+            whose colour follows its brightness, even when it's strongly tinted. A colour picture has pixels of the
+            same brightness in different colours, even one that's mostly a single hue (like skin, or a red shirt).
+        sharpness (float): The mean brightness gradient of its centered square, scaled to 128 pixels (on a 0-255
+            scale). A blurrier copy of a picture has less. It goes with contrast too (a faded copy has less), so
+            sharpness / contrast compares the sharpness of copies with different contrast.
+        contrast (float): The spread of brightness of its centered square (standard deviation, 0-255).
+    """
+    width: int = 0
+    height: int = 0
+    file_size: int = 0
+    format: str = ""
+    jpeg_quality: int | None = None
+    animated: bool = False
+    colourfulness: float = 0.0
+    coloured: float = 0.0
+    colour_variety: float = 0.0
+    sharpness: float = 0.0
+    contrast: float = 0.0
+
+    @property
+    def pixels(self) -> int:
+        """How many pixels it has"""
+        return self.width * self.height
+
+
+def _jpeg_quality(im: Image.Image) -> int | None:
+    """
+    Estimate the quality a JPEG was saved at, from how much its luminance quantization table is scaled from libjpeg's
+        standard one (which is what quality 50 uses).
+
+    Returns:
+        int | None: 1-100, or None if it has no table (not a JPEG).
+    """
+    tables = getattr(im, "quantization", None)
+    if not tables or 0 not in tables:
+        return None
+
+    scale = sum(tables[0]) / _STANDARD_LUMA_TABLE_SUM * 100
+    quality = (200 - scale) / 2 if scale <= 100 else 5000 / scale
+    return round(min(100, max(1, quality)))
+
+
+def _colour_sample(im: Image.Image) -> np.ndarray | None:
+    """
+    A COLOUR_SAMPLE square copy of an image (or the current frame of an animation), as a YCbCr array.
+
+    Transparent pixels show the white background, like grayscale does for hashing.
+
+    Returns:
+        np.ndarray | None: The sample, or None if the image has no colour to measure (like a 16-bit grayscale one).
+    """
+    if im.mode.startswith(("I", "F")):
+        return None
+
+    size = (COLOUR_SAMPLE, COLOUR_SAMPLE)
+    if im.mode in {"YCbCr", "RGB", "L"}:
+        small = im.resize(size, Image.Resampling.BILINEAR, reducing_gap=2.0)
+    else:
+        small = im.convert("RGBA").resize(size, Image.Resampling.BILINEAR, reducing_gap=2.0)
+        small = Image.alpha_composite(Image.new("RGBA", size, "white"), small)
+
+    return np.asarray(small.convert("YCbCr") if small.mode != "YCbCr" else small)
+
+
+def _colour_measures(sample: np.ndarray | None) -> tuple[float, float, float]:
+    """
+    How colourful a colour sample is (see ImageQuality).
+
+    Returns:
+        (colourfulness, coloured, colour_variety)
+    """
+    if sample is None:
+        return 0.0, 0.0, 0.0
+
+    brightness = sample[..., 0].ravel()
+    cb = sample[..., 1].ravel().astype(np.float32) - 128
+    cr = sample[..., 2].ravel().astype(np.float32) - 128
+    chroma = np.hypot(cb, cr)
+
+    # The average colour at each of 16 brightness levels, and how far each pixel's colour is from its level's
+    levels = brightness // 16
+    counts = np.bincount(levels, minlength=16)
+    level_cb = np.bincount(levels, weights=cb, minlength=16) / np.maximum(counts, 1)
+    level_cr = np.bincount(levels, weights=cr, minlength=16) / np.maximum(counts, 1)
+    variety = np.hypot(cb - level_cb[levels], cr - level_cr[levels]).mean()
+    return float(chroma.mean()), float((chroma > COLOURED_CHROMA).mean()), float(variety)
+
 
 def _is_animation(im: Image.Image) -> bool:
     """Is this image an animation? This goes by what's in the file, not its extension"""
@@ -131,9 +249,10 @@ def _is_animation(im: Image.Image) -> bool:
         return False
 
 
-def calculate_hashes(f, *, exact_match=False, draft=False) -> tuple[int | str, set[int], bytes | None]:
+def calculate_hashes(f, *, exact_match=False, draft=False,
+                     file_size: int | None = None) -> tuple[int | str, set[int], bytes | None, ImageQuality]:
     """
-    Calculate hashes for a given file.
+    Calculate hashes for a given file, and measure its quality (see ImageQuality) while it's open.
 
     Args:
         f (IO or str or Path): Either a file path to process, or a in-memory BytesIO object ready for reading.
@@ -141,31 +260,42 @@ def calculate_hashes(f, *, exact_match=False, draft=False) -> tuple[int | str, s
             If true, strength must be 10.
             If false, perceptual hashes will be used, even with high strength.
         draft (bool): Decode JPEGs at a reduced size? Much faster, but can change the hash by a couple bits.
+        file_size (int | None): The file's size, if f isn't a path (like a file in a zip).
 
     Returns:
-        tuple[int | str, set, bytes | None]: The first element is the primary hash,
+        tuple[int | str, set, bytes | None, ImageQuality]: The first element is the primary hash,
             the second element are any secondary hashes representing rotations, flips, etc...
             Perceptual hashes are 64-bit ints, and the SHA256 hash is a hex string (with no secondary hashes).
             The third element are the centre hashes (see phash.centre_hashes), for finding copies turned by a few
             degrees. None for SHA256 hashes, and images with a blank middle.
+            The fourth is the image's quality. For SHA256 hashes the image isn't opened, so it only has the file size.
     """
+    if file_size is None and isinstance(f, (str, Path)):
+        file_size = Path(f).stat().st_size
+
     if exact_match:
         hasher = hashlib.sha256()
         block_size = 65536
         with (open(f, "rb") if isinstance(f, (str, Path)) else f) as file:  # ruff: ignore[builtin-open]
             for block in iter(lambda: file.read(block_size), b""):
                 hasher.update(block)
-        return hasher.hexdigest(), set(), None
+        return hasher.hexdigest(), set(), None, ImageQuality(file_size=file_size or 0)
 
     with Image.open(f) as im:
         animated = _is_animation(im)
+        full_width, full_height = im.size
+        image_format = im.format or ""
+        jpeg_quality = _jpeg_quality(im) if image_format in JPEG_FORMATS else None
         if draft:
-            # JPEGs can be decoded at 1/2 to 1/8 of their size (and straight to grayscale), which is several times
-            #   faster than decoding all of a large photo just to shrink it. This does nothing for other formats.
-            #   It leaves the short side at least CENTRE_WORK pixels, so the centre hashes lose nothing either.
-            im.draft("L", (phash.HASH_IMG_SIZE * 4, phash.HASH_IMG_SIZE * 4))
+            # JPEGs can be decoded at 1/2 to 1/8 of their size, which is several times faster than decoding all of a
+            #   large photo just to shrink it. This does nothing for other formats. It leaves the short side at least
+            #   CENTRE_WORK pixels, so the centre hashes lose nothing either.
+            #   A colour JPEG is decoded as YCbCr, which costs little more than grayscale: its Y channel is exactly
+            #   what decoding it as grayscale gives, and Cb and Cr give its colour (see ImageQuality)
+            colour_jpeg = image_format in JPEG_FORMATS and im.mode in {"RGB", "YCbCr"}
+            im.draft("YCbCr" if colour_jpeg else "L", (phash.HASH_IMG_SIZE * 4, phash.HASH_IMG_SIZE * 4))
         orientation = im.getexif().get(phash.EXIF_ORIENTATION_TAG, 1)
-        gray = phash.grayscale(im)
+        gray = im.getchannel("Y") if im.mode == "YCbCr" else phash.grayscale(im)
         px = phash.resized_pixels(gray, phash.HASH_IMG_SIZE)
         if animated:
             # Some animations start with a blank frame (nothing, or only a single color). Its hash would be noise
@@ -179,8 +309,24 @@ def calculate_hashes(f, *, exact_match=False, draft=False) -> tuple[int | str, s
                     gray = phash.grayscale(im)
                     px = phash.resized_pixels(gray, phash.HASH_IMG_SIZE)
 
+        colourfulness, coloured, colour_variety = _colour_measures(_colour_sample(im))
+
     centre = phash.centre_array(gray)
     width, height = gray.size
+    gradient_y, gradient_x = np.gradient(centre)
+    quality = ImageQuality(
+        width=full_height if orientation >= 5 else full_width,  # Quarter turns swap them, see below
+        height=full_width if orientation >= 5 else full_height,
+        file_size=file_size or 0,
+        format=image_format,
+        jpeg_quality=jpeg_quality,
+        animated=animated,
+        colourfulness=colourfulness,
+        coloured=coloured,
+        colour_variety=colour_variety,
+        sharpness=float(np.hypot(gradient_x, gradient_y).mean()),
+        contrast=float(centre.std()),
+    )
 
     # Hash the image the way it is displayed, not the way it is stored
     if orientation in phash.EXIF_ORIENTATIONS:
@@ -190,13 +336,13 @@ def calculate_hashes(f, *, exact_match=False, draft=False) -> tuple[int | str, s
             width, height = height, width
 
     if phash.is_flat(px):
-        return phash.FLAT_HASH, set(), None
+        return phash.FLAT_HASH, set(), None, quality
 
     # All the rotations and mirrors are made from the one small resized array, which is far cheaper than
     #   transforming the full size image. For animations we'll look for mirrored versions but thats it
     variants = (px, np.fliplr(px)) if animated else tuple(phash.orientations(px))
     initial_hash, *extras = (phash.phash(variant) for variant in variants)
-    return initial_hash, set(extras), phash.centre_hashes(np.ascontiguousarray(centre), width, height)
+    return initial_hash, set(extras), phash.centre_hashes(np.ascontiguousarray(centre), width, height), quality
 
 
 @contextmanager
@@ -273,7 +419,8 @@ def _process_image(
 
             try:
                 with zf.open(f) as zipped_file:
-                    results[f.filename] = calculate_hashes(zipped_file, exact_match=exact_match, draft=draft)
+                    results[f.filename] = calculate_hashes(zipped_file, exact_match=exact_match, draft=draft,
+                                                           file_size=f.file_size)
             except BadZipFile as e:
                 logger.warning("Could not read %s in %s due to %s", f.filename, path, e)
             except UnidentifiedImageError:
@@ -714,6 +861,7 @@ class ImageMatcher:
         #   _reverse_hashes only has the hash of the group each image joined, so these are what let `regroup`
         #   match everything again at another strength without hashing any of it again.
         self._image_hashes = {}
+        self._image_quality = {}  # Path -> its ImageQuality, see quality
         self._next_order = 0
         # Every image's neighbours (see find_neighbours), so regrouping doesn't have to look each image up in an index:
         #   (the orders of the images they're for, indptr, hashes, distances). Found by the first regroup that needs
@@ -856,6 +1004,15 @@ class ImageMatcher:
         # Wake up anything waiting for a pause to end, so it sees that processing is finished instead of waiting forever
         self._not_paused.set()
 
+    def quality(self, path: ZipPath) -> ImageQuality | None:
+        """
+        An image's quality, measured when it was hashed (see ImageQuality).
+
+        Returns:
+            ImageQuality | None: Its quality, or None if it isn't loaded.
+        """
+        return self._image_quality.get(path)
+
     def is_finished(self):
         """Is processing finished"""
         return self._finished.is_set()
@@ -876,6 +1033,7 @@ class ImageMatcher:
         with self.paused():
             hash_ = self._reverse_hashes.pop(path)
             self._image_hashes.pop(path, None)
+            self._image_quality.pop(path, None)
             self._remove_path_centres(path)
             group = self._hashes[hash_]
             group.matches.remove(path)
@@ -919,6 +1077,8 @@ class ImageMatcher:
             hash_ = self._reverse_hashes.pop(old_path)
             self._reverse_hashes[new_path] = hash_
             self._image_hashes[new_path] = self._image_hashes.pop(old_path)  # Keeps its order for regrouping
+            if old_path in self._image_quality:
+                self._image_quality[new_path] = self._image_quality.pop(old_path)
             if old_path in self._path_centres:
                 stored = self._path_centres[old_path]
                 self._remove_path_centres(old_path)
@@ -1202,7 +1362,7 @@ class ImageMatcher:
             # This image was removed AFTER it was queue'd! So just leave...
             return False
 
-        initial_hash, extra_hashes, centre = hashes
+        initial_hash, extra_hashes, centre, quality = hashes
         extra_hashes.add(initial_hash)
         if not isinstance(path, ZipPath):
             # From this point on, EVERYTHING should be a ZipPath
@@ -1213,6 +1373,7 @@ class ImageMatcher:
             return False
 
         self._image_hashes[path] = (self._next_order, (initial_hash, *(extra_hashes - {initial_hash})), centre)
+        self._image_quality[path] = quality
         self._next_order += 1
         self._add_image(path, initial_hash, extra_hashes, centre)
         return True
