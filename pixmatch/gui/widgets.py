@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from functools import cache
-from itertools import count
+from itertools import count, starmap
 from pathlib import Path
 from typing import Callable, Sequence
 from zipfile import BadZipFile, ZipFile
@@ -743,6 +743,72 @@ def get_overlay_icon(height, width):
         QtCore.Qt.AspectRatioMode.KeepAspectRatio,
         QtCore.Qt.TransformationMode.FastTransformation,
     )
+
+
+class FolderButton(Enum):
+    """The buttons beside the folder list, which get FolderButton icons like VisiPics had"""
+    ADD = "add"
+    REMOVE = "remove"
+    UP = "up"
+    DOWN = "down"
+
+
+def folder_button_icon(button: FolderButton, color: QtGui.QColor) -> QtGui.QIcon:
+    """
+    Draw a folder list button's icon, like VisiPics': a curved arrow into the list with a + to add, and out of it with
+        a - to remove; a triangle up with a + to move up, and down with a - to move down.
+
+    It's drawn rather than loaded, so it's sharp at any display scaling.
+
+    Returns:
+        QtGui.QIcon: The icon, drawn in `color`.
+    """
+    size = 64  # Drawn on a 64 x 64 grid, then scaled down by the button
+    pixmap = QtGui.QPixmap(size * 2, size * 2)
+    pixmap.setDevicePixelRatio(2)
+    pixmap.fill(QtCore.Qt.GlobalColor.transparent)
+    painter = QtGui.QPainter(pixmap)
+    painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+    pen = QtGui.QPen(color, 8)
+    pen.setCapStyle(QtCore.Qt.PenCapStyle.FlatCap)
+    brush = QtGui.QBrush(color)
+
+    def polygon(*points):
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        painter.setBrush(brush)
+        painter.drawPolygon(QtGui.QPolygonF(list(starmap(QtCore.QPointF, points))))
+
+    def curve(start, control, end):
+        path = QtGui.QPainterPath(QtCore.QPointF(*start))
+        path.quadTo(QtCore.QPointF(*control), QtCore.QPointF(*end))
+        painter.setPen(pen)
+        painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+        painter.drawPath(path)
+
+    def plus(x, y):
+        painter.fillRect(QtCore.QRectF(x - 7, y - 2, 14, 4), color)
+        painter.fillRect(QtCore.QRectF(x - 2, y - 7, 4, 14), color)
+
+    def minus(x, y):
+        painter.fillRect(QtCore.QRectF(x - 7, y - 2, 14, 4), color)
+
+    if button == FolderButton.ADD:
+        curve((18, 56), (18, 24), (38, 22))
+        polygon((37, 10), (56, 22), (37, 34))
+        plus(50, 50)
+    elif button == FolderButton.REMOVE:
+        curve((46, 8), (46, 40), (26, 42))
+        polygon((27, 30), (8, 42), (27, 54))
+        minus(14, 14)
+    elif button == FolderButton.UP:
+        polygon((10, 46), (44, 46), (27, 26))
+        plus(51, 16)
+    else:
+        polygon((10, 24), (44, 24), (27, 44))
+        minus(51, 50)
+
+    painter.end()
+    return QtGui.QIcon(pixmap)
 
 
 class _ThumbnailJob(QtCore.QRunnable):

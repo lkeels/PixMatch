@@ -22,12 +22,14 @@ from pixmatch.gui.widgets import (
     LISTED_MIME,
     DirFileSystemModel,
     DuplicateGroupList,
+    FolderButton,
     FolderListWidget,
     ImageViewPane,
     SelectionState,
     SelectionValue,
     SelectionValues,
     TileAction,
+    folder_button_icon,
     same_folder,
 )
 from pixmatch.utils import human_bytes
@@ -1522,35 +1524,36 @@ class MainWindow(QtWidgets.QMainWindow):
         Returns:
             QtWidgets.QHBoxLayout: The file path selection display with associated controls in a layout
         """
-        # TODO: I need better icons here but I can't find the "in"/"out" icons in VP execution data...
+        # Small square buttons at the top and bottom of each side of the list, with icons like VisiPics': add and
+        #   remove on the left, move up and down on the right
+        color = self.palette().color(QtGui.QPalette.ColorRole.ButtonText)
 
-        # region Selected File Path sort controls
-        file_path_up_control = QtWidgets.QPushButton("^+")
-        file_path_up_control.setSizePolicy(MAX_SIZE_POLICY)
-        file_path_up_control.clicked.connect(self.file_path_up_clicked)
-        file_path_down_control = QtWidgets.QPushButton("V-")
-        file_path_down_control.setSizePolicy(MAX_SIZE_POLICY)
-        file_path_down_control.clicked.connect(self.file_path_down_clicked)
+        def button(kind: FolderButton, tip: str, clicked) -> QtWidgets.QToolButton:
+            btn = QtWidgets.QToolButton(toolTip=tip, autoRaise=False)
+            btn.setIcon(folder_button_icon(kind, color))
+            btn.setIconSize(QtCore.QSize(20, 20))
+            btn.setFixedSize(30, 30)
+            btn.clicked.connect(clicked)
+            return btn
 
-        file_path_sort_controls = QtWidgets.QVBoxLayout()
-        file_path_sort_controls.setContentsMargins(NO_MARGIN)
-        file_path_sort_controls.addWidget(file_path_up_control)
-        file_path_sort_controls.addWidget(file_path_down_control)
-        # endregion
+        def column(top: QtWidgets.QToolButton, bottom: QtWidgets.QToolButton) -> QtWidgets.QWidget:
+            layout = QtWidgets.QVBoxLayout()
+            layout.setContentsMargins(NO_MARGIN)
+            layout.addWidget(top)
+            layout.addStretch(1)
+            layout.addWidget(bottom)
+            return QtWidgets.QWidget(layout=layout)
 
-        # region Selected File Path selection controls
-        file_path_in_control = QtWidgets.QPushButton(">+")
-        file_path_in_control.setSizePolicy(MAX_SIZE_POLICY)
-        file_path_in_control.clicked.connect(self.file_path_in_clicked)
-        file_path_out_control = QtWidgets.QPushButton("<-")
-        file_path_out_control.setSizePolicy(MAX_SIZE_POLICY)
-        file_path_out_control.clicked.connect(self.file_path_out_clicked)
-
-        file_path_io_controls = QtWidgets.QVBoxLayout()
-        file_path_io_controls.setContentsMargins(NO_MARGIN)
-        file_path_io_controls.addWidget(file_path_in_control)
-        file_path_io_controls.addWidget(file_path_out_control)
-        # endregion
+        add_remove = column(
+            button(FolderButton.ADD, "Add the folders selected in the tree (or drag them into the list)",
+                   self.file_path_in_clicked),
+            button(FolderButton.REMOVE, "Remove the selected folders (or drag them out of the list)",
+                   self.file_path_out_clicked),
+        )
+        up_down = column(
+            button(FolderButton.UP, "Move the selected folders up (or drag them)", self.file_path_up_clicked),
+            button(FolderButton.DOWN, "Move the selected folders down (or drag them)", self.file_path_down_clicked),
+        )
 
         self.selected_file_path_display = FolderListWidget()
         self.selected_file_path_display.foldersDropped.connect(self.add_folders)
@@ -1560,9 +1563,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         file_path_controls = QtWidgets.QHBoxLayout()
         file_path_controls.setContentsMargins(NO_MARGIN)
-        file_path_controls.addWidget(QtWidgets.QWidget(layout=file_path_io_controls, maximumWidth=50))
+        file_path_controls.addWidget(add_remove)
         file_path_controls.addWidget(self.selected_file_path_display)
-        file_path_controls.addWidget(QtWidgets.QWidget(layout=file_path_sort_controls, maximumWidth=50))
+        file_path_controls.addWidget(up_down)
         return file_path_controls
 
     def file_path_up_clicked(self, _):
