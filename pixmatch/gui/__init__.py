@@ -52,6 +52,9 @@ GROUP_FILTER_OPTIONS = {
     "Hide groups only in zips": has_image_outside_zips,
 }
 
+# The thumbnail sizes in the View menu, in pixels. The first is the size before one is chosen
+THUMBNAIL_SIZES = {"Small": 64, "Medium": 96, "Large": 128}
+
 logger = logging.getLogger(__name__)
 
 
@@ -195,6 +198,10 @@ class MainWindow(QtWidgets.QMainWindow):
         #   page that's shown. The page that's shown always starts where it did, until it's rebuilt
         self._page_starts = [0]
         self._shown_from = 0
+        # The group the user was looking at: the first one on the page they last went to. Re-fitting the pages
+        #   (resizing, changing the thumbnail size, groups found) stays on the page with this group, so doing that
+        #   several times doesn't drift away from it. Going to a page sets it again
+        self._anchor = None
         # The seq of the last event the page already has (see update_group_list). Reset it if the processor is replaced
         self._page_seq = 0
         self.processor = None
@@ -211,6 +218,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # UI build
         self.build_menubar()
         self.build_central()
+        self.set_thumbnail_size(self._settings.value("view/thumbnail_size", defaultValue=0, type=int), save=False)
         self.build_statusbar()
         self.build_extra()
 
@@ -337,12 +345,25 @@ class MainWindow(QtWidgets.QMainWindow):
         # QtGui.QAction("Slow preview display", self)
         # QtGui.QAction("Show differences", self)
 
+        # Thumbnail sizes, one of which is checked (see set_thumbnail_size)
+        thumbnail_sizes = QtGui.QActionGroup(self)
+        thumbnail_sizes.setExclusive(True)
+        self._thumbnail_size_actions = {}
+        for text, px in THUMBNAIL_SIZES.items():
+            action = QtGui.QAction(f"{text} thumbnails", self, checkable=True)
+            action.triggered.connect(lambda _checked, px=px: self.set_thumbnail_size(px))
+            thumbnail_sizes.addAction(action)
+            self._thumbnail_size_actions[px] = action
+
         view_menu = menu.addMenu("&View")
         view_menu.addAction(page_next)
         view_menu.addAction(page_back)
         view_menu.addSeparator()
         view_menu.addAction(self.preview_resized)
         view_menu.addAction(preview_full_size)
+        view_menu.addSeparator()
+        for action in self._thumbnail_size_actions.values():
+            view_menu.addAction(action)
         # endregion
 
         # region Tools menu
@@ -837,6 +858,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._drop_marks_without_duplicates()
 
         self.current_page = 1
+        self._anchor = None
         self.update_group_list()
         self.update_labels()
         tilted = " with tilted copies" if self.processor.rotation else ""
@@ -880,6 +902,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.current_page = 1
         self._page_starts = [0]
         self._shown_from = 0
+        self._anchor = None
         self._elapsed_secs = 0
         self._timer_label.setText("00:00:00")
         self.image_view_area.clear()
@@ -1057,6 +1080,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 sizes = [len(group.matches) for group in self.processor.matches]
 
         first = self._page_starts[min(self.current_page, len(self._page_starts)) - 1]
+        if self._anchor is not None:
+            first = self._anchor
         self._page_starts = self.duplicate_group_list.page_starts(sizes)
         self.current_page = bisect.bisect_right(self._page_starts, first)
 
@@ -1150,6 +1175,7 @@ class MainWindow(QtWidgets.QMainWindow):
         Prompt for a page number and jump there.
         Uses a numeric-only dialog with range [1, total_pages].
         """
+        self._anchor = None
         total = self.total_pages
         if total == 1:
             return
@@ -1171,6 +1197,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_page_down(self, *_):
         """The page down button has been pressed"""
+        self._anchor = None
         if self.total_pages == 1:
             # Theres only one page so do nothing
             return
@@ -1185,6 +1212,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_page_up(self, *_):
         """The page up button has been pressed"""
+        self._anchor = None
         if self.total_pages == 1:
             # Theres only one page....
             return
@@ -1199,12 +1227,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_page_first(self):
         """Go to first page button pressed"""
+        self._anchor = None
         if self.current_page != 1:
             self.current_page = 1
             self.update_group_list()
 
     def on_page_last(self):
         """Go to last page button pressed"""
+        self._anchor = None
         last_page = self.total_pages
         if self.current_page != last_page:
             self.current_page = last_page
@@ -1492,6 +1522,24 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.processor.remove(path)
     # endregion
 
+    def set_thumbnail_size(self, px: int, *, save: bool = True):
+        """
+        Show the thumbnails at this size (one of THUMBNAIL_SIZES), and remember it for next time.
+
+        The page is rebuilt with the new size, which changes how many groups fit on it: it stays on the page with the
+            group the current one starts with, like resizing the window.
+        """
+        if px not in self._thumbnail_size_actions:
+            px = next(iter(THUMBNAIL_SIZES.values()))
+
+        self._thumbnail_size_actions[px].setChecked(True)
+        if save:
+            self._settings.setValue("view/thumbnail_size", px)
+
+        self.duplicate_group_list.set_thumb_size(px)
+        if self.processor:
+            self.update_group_list()
+
     def update_group_list(self):
         """Work out the pages again, and show the current one"""
         self.image_view_area.clear()
@@ -1509,6 +1557,8 @@ class MainWindow(QtWidgets.QMainWindow):
             groups = [list(m.matches) for m in self.processor.matches[start:end]]
 
         self._shown_from = start
+        if self._anchor is None:
+            self._anchor = start
         self.duplicate_group_list.set_groups(groups)
         self.update_selection_states()
         self.duplicate_group_list.update_page_indicator(self.current_page, self.total_pages)

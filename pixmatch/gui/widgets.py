@@ -855,6 +855,8 @@ class ThumbnailLoader(QtCore.QObject):
     Loading a page's thumbnails on the GUI thread froze it until every image was decoded (seconds, for large photos).
         This way the page shows straight away, each thumbnail appears as soon as it loads,
         and thumbnails that were shown recently appear instantly.
+    The ones kept are limited by the memory they take, since that grows with the thumbnail size: 4 bytes a pixel, so
+        100MB is ~6000 thumbnails at 64 pixels and ~1500 at 128.
 
     Signals:
         thumbnailLoaded(path: ZipPath, thumb_size: int, pixmap: QPixmap): A thumbnail from `get` has loaded.
@@ -862,11 +864,12 @@ class ThumbnailLoader(QtCore.QObject):
     thumbnailLoaded = QtCore.Signal(ZipPath, int, QtGui.QPixmap)
     _imageLoaded = QtCore.Signal(ZipPath, int, QtGui.QImage)  # Emitted on the pool's threads, handled on the GUI's
 
-    def __init__(self, parent=None, *, threads: int = 4, cache_size: int = 2000):
+    def __init__(self, parent=None, *, threads: int = 4, cache_bytes: int = 100 * 2 ** 20):
         super().__init__(parent)
         self._pool = QtCore.QThreadPool(self)
         self._pool.setMaxThreadCount(threads)
-        self._cache_size = cache_size
+        self._cache_bytes = cache_bytes
+        self._cached_bytes = 0
         self._cache = OrderedDict()  # (path, thumb_size) -> QPixmap, least recently used first
         self._pending = set()  # (path, thumb_size) that are loading
         self._imageLoaded.connect(self._on_image_loaded)
@@ -933,6 +936,11 @@ class ThumbnailLoader(QtCore.QObject):
 
         self._zip_requests.clear()
 
+    @staticmethod
+    def _pixmap_bytes(pixmap: QtGui.QPixmap) -> int:
+        """Roughly how much memory a thumbnail takes"""
+        return pixmap.width() * pixmap.height() * 4
+
     def _on_image_loaded(self, path: ZipPath, thumb_size: int, image: QtGui.QImage):
         """Keep a thumbnail that finished loading, and pass it on as a QPixmap (which only the GUI thread can make)"""
         key = (path, thumb_size)
@@ -940,10 +948,13 @@ class ThumbnailLoader(QtCore.QObject):
         pixmap = QtGui.QPixmap.fromImage(image)
         if not pixmap.isNull():
             # Images that couldn't be read aren't kept, so they're tried again the next time they're shown
+            old = self._cache.pop(key, None)
+            if old is not None:
+                self._cached_bytes -= self._pixmap_bytes(old)
             self._cache[key] = pixmap
-            self._cache.move_to_end(key)
-            while len(self._cache) > self._cache_size:
-                self._cache.popitem(last=False)
+            self._cached_bytes += self._pixmap_bytes(pixmap)
+            while self._cached_bytes > self._cache_bytes and len(self._cache) > 1:
+                self._cached_bytes -= self._pixmap_bytes(self._cache.popitem(last=False)[1])
 
         self.thumbnailLoaded.emit(path, thumb_size, pixmap)
 
@@ -1380,7 +1391,7 @@ class DuplicateGroupList(QtWidgets.QWidget):
         self._resize_timer.timeout.connect(self._check_page_size)
 
     def set_thumb_size(self, px: int) -> None:
-        """Set square thumbnail size for subsequent loads."""
+        """Set the thumbnail size for the groups shown from now on (set_groups)"""
         self._thumb_size = max(32, int(px))
         self._tile_size = None
 
