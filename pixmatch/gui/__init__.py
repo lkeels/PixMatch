@@ -17,7 +17,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from send2trash import send2trash
 
 from pixmatch import Finished, ImageMatcher, NewGroup, NewMatch, ZipPath, _is_under, has_image_outside_zips
-from pixmatch.autoselect import Move, moved_name
+from pixmatch.autoselect import Candidate, Decision, Move, Skip, decide, folder_rank, moved_name
 from pixmatch.gui.utils import MAX_SIZE_POLICY, NO_MARGIN
 from pixmatch.gui.widgets import (
     LISTED_MIME,
@@ -176,6 +176,56 @@ class RegroupThread(QtCore.QRunnable):
                 self.signals.cancelled.emit()
 
 
+class AutoSelectSignals(QtCore.QObject):
+    """
+    Signals from a running Auto-select.
+
+    progress(done, total): How many groups are decided so far, of how many.
+    done(decisions): It finished: a Decision for each group.
+    cancelled(): It was cancelled. Nothing was changed.
+    failed(error): It failed. Nothing was changed.
+    """
+
+    progress = QtCore.Signal(int, int)
+    done = QtCore.Signal(list)
+    cancelled = QtCore.Signal()
+    failed = QtCore.Signal(str)
+
+
+class AutoSelectThread(QtCore.QRunnable):
+    """Decides every group (see pixmatch.autoselect.decide) off of the GUI thread, from a snapshot of the groups"""
+
+    PROGRESS_EVERY = 500  # Groups between progress reports (and chances to cancel)
+
+    def __init__(self, groups: list[list[Candidate]]):
+        super().__init__()
+        self.groups = groups
+        self.signals = AutoSelectSignals()
+        self.cancel_requested = False  # Set from the GUI thread to cancel, see cancel
+
+    def cancel(self):
+        """Stop at the next progress report, without changing anything"""
+        self.cancel_requested = True
+
+    def run(self):
+        """Decide each group"""
+        decisions = []
+        total = len(self.groups)
+        try:
+            for i, group in enumerate(self.groups):
+                if i % self.PROGRESS_EVERY == 0:
+                    if self.cancel_requested:
+                        self.signals.cancelled.emit()
+                        return
+                    self.signals.progress.emit(i, total)
+                decisions.append(decide(group))
+        except Exception as e:
+            logger.exception("Auto-select failed")
+            self.signals.failed.emit(f"{type(e).__name__}: {e}")
+        else:
+            self.signals.done.emit(decisions)
+
+
 class MainWindow(QtWidgets.QMainWindow):
     """
     The main application window emulating VisiPics' primary workflow.
@@ -210,6 +260,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.file_states = {}
         # The files planned to move (MOVE in file_states) -> where to (see plan_move). A plan is carried out by Apply
         self.planned_moves: dict[ZipPath, Move] = {}
+        # Whether Auto-select made the plan that's waiting (a plan waits for Apply even if it has no moves), and its
+        #   thread while it runs
+        self._autoselect_plan = False
+        self._autoselect_thread = None
         self.ignored = IgnoredImages()
         self._threadpool = QtCore.QThreadPool()
 
@@ -376,8 +430,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # endregion
 
         # region Tools menu
-        autoselect = QtGui.QAction("Auto-select", self)
-        autoselect.setEnabled(False)  # TODO:
+        autoselect = QtGui.QAction("Auto-select", self, enabled=False)  # Once a scan is loaded, see _update_autoselect
+        autoselect.triggered.connect(self.start_autoselect)
+        self._autoselect_controls = [autoselect]
 
         tool_menu = menu.addMenu("&Tools")
         tool_menu.addAction(autoselect)
@@ -445,8 +500,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # region General controls area (top-right)
         # region Control buttons
-        autoselect_btn = QtWidgets.QPushButton("Auto-select")
-        autoselect_btn.setEnabled(False)  # TODO:
+        autoselect_btn = QtWidgets.QPushButton("Auto-select", enabled=False)
+        autoselect_btn.setToolTip("Plan which copy of each picture to keep, and which to delete or move into place")
+        autoselect_btn.pressed.connect(self.start_autoselect)
+        self._autoselect_controls.append(autoselect_btn)
 
         tools = QtWidgets.QVBoxLayout()
         tools.addWidget(autoselect_btn)
@@ -928,7 +985,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._regroup_failed = False
         self.file_states = {}
         self.planned_moves = {}
+        self._autoselect_plan = False
         self._update_plan_buttons()
+        self._update_autoselect()
         self.current_page = 1
         self._page_starts = [0]
         self._shown_from = 0
@@ -1199,6 +1258,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.set_duplicate_images_label(self.processor.duplicate_images)
         self.set_deleted_files_label(self.deleted_files_count)
         self.set_deleted_size_label(self.deleted_files_size)
+        self._update_autoselect()
 
     def on_page_jump_request(self):
         """
@@ -1826,6 +1886,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._cancel_regroup_btn.hide()
         sb.addPermanentWidget(self._cancel_regroup_btn)
 
+        # Only shown while Auto-select runs
+        self._cancel_autoselect_btn = QtWidgets.QPushButton("Cancel")
+        self._cancel_autoselect_btn.clicked.connect(self.cancel_autoselect)
+        self._cancel_autoselect_btn.hide()
+        sb.addPermanentWidget(self._cancel_autoselect_btn)
+
     def delete_file(self, path: Path) -> int:
         """
         Delete a file, or send it to the recycle bin if that option is set.
@@ -1879,8 +1945,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.update_selection_states()
 
     def plan_waiting(self) -> bool:
-        """Is a plan waiting to be applied (are any files planned to move)?"""
-        return bool(self.planned_moves)
+        """Is a plan waiting to be applied (from Auto-select, or any files planned to move)?"""
+        return self._autoselect_plan or bool(self.planned_moves)
 
     def _update_plan_buttons(self):
         """While a plan is waiting, Apply and Clear plan take the place of Delete and Move"""
@@ -1929,6 +1995,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.file_states = {p: s for p, s in self.file_states.items() if p not in planned}
         self.planned_moves = {}
+        self._autoselect_plan = False
         self._update_plan_buttons()
         if self.processor:
             self.update_group_list()
@@ -2004,6 +2071,7 @@ class MainWindow(QtWidgets.QMainWindow):
         finally:
             self.deleted_files_count += deleted
             self.deleted_files_size += deleted_size
+            self._autoselect_plan = False
             self._update_plan_buttons()
             self.update_labels()
             self.update_group_list()
@@ -2015,6 +2083,136 @@ class MainWindow(QtWidgets.QMainWindow):
         if failed:
             result += "\nCouldn't do these (they're left as they were):\n" + "\n".join(failed[:20])
         QtWidgets.QMessageBox.information(self, "Plan applied", result)
+
+    def _update_autoselect(self):
+        """Auto-select works on a loaded scan, while nothing else changes the groups"""
+        scanning = getattr(self, "_thread", None) is not None  # (Not set until the first scan)
+        enabled = (self.processor is not None and self.processor.is_finished() and not scanning
+                   and not self._regrouping and self._autoselect_thread is None)
+        for control in self._autoselect_controls:
+            control.setEnabled(enabled)
+
+    def start_autoselect(self):
+        """
+        Auto-select pressed: plan which copy of each picture to keep (see plans/auto_select.md).
+
+        Every current MARKED and MOVE TO file is un-selected first, so ask before that. Nothing changes until it's done,
+            so cancelling leaves everything as it was.
+        """
+        if not self.processor or not self.processor.is_finished() or self._regrouping or self._autoselect_thread:
+            return
+
+        marked = sum(state.state == SelectionState.MARK for state in self.file_states.values())
+        moving = len(self.planned_moves)
+        if (marked or moving) and not self.confirm(
+                "Auto-select",
+                f"Auto-select starts over: it un-selects the {marked:,} MARKED"
+                f"{f' and {moving:,} MOVE TO' if moving else ''} file(s) first.\n\n"
+                "To act on them, press No, and use Delete, Move or Apply first. IGNORED files stay ignored.\n\n"
+                "Start Auto-select?",
+        ):
+            return
+
+        # A snapshot of every shown group, so the scan's data isn't read from the other thread
+        folders = self.file_paths_selected()
+        with self.processor.paused():
+            groups = [[Candidate(path, self.processor.quality(path), folder_rank(path, folders), path in self.ignored)
+                       for path in group.matches if self.processor.quality(path) is not None]
+                      for group in self.processor.matches]
+
+        logger.info("Auto-selecting %s groups", len(groups))
+        self.centralWidget().setEnabled(False)
+        self.menuBar().setEnabled(False)
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+        self._progress_bar.setRange(0, max(1, len(groups)))
+        self._progress_bar.setValue(0)
+        self._cancel_autoselect_btn.setText("Cancel")
+        self._cancel_autoselect_btn.setEnabled(True)
+        self._cancel_autoselect_btn.show()
+        self.statusBar().showMessage("Auto-selecting...")
+
+        thread = AutoSelectThread(groups)
+        thread.signals.progress.connect(self.on_autoselect_progress)
+        thread.signals.done.connect(self.on_autoselect_done)
+        thread.signals.cancelled.connect(self.on_autoselect_cancelled)
+        thread.signals.failed.connect(self.on_autoselect_failed)
+        self._autoselect_thread = thread  # The signals must outlive run() until they're delivered
+        self._update_autoselect()
+        self._threadpool.start(thread)
+
+    def on_autoselect_progress(self, done: int, total: int):
+        """Show how far Auto-select has got"""
+        self._progress_bar.setRange(0, max(1, total))
+        self._progress_bar.setValue(done)
+        self.statusBar().showMessage(f"Auto-selecting... {done:,} of {total:,} groups")
+
+    def cancel_autoselect(self):
+        """The Cancel button was pressed while Auto-select runs"""
+        if self._autoselect_thread is not None:
+            self._autoselect_thread.cancel()
+            self._cancel_autoselect_btn.setText("Cancelling...")
+            self._cancel_autoselect_btn.setEnabled(False)
+
+    def _end_autoselect(self):
+        """Give the GUI back after Auto-select"""
+        self._autoselect_thread = None
+        self._cancel_autoselect_btn.hide()
+        self._progress_bar.setRange(0, 100)
+        QtWidgets.QApplication.restoreOverrideCursor()
+        self.centralWidget().setEnabled(True)
+        self.menuBar().setEnabled(True)
+        self.update_labels()  # (which also turns Auto-select back on)
+
+    def on_autoselect_cancelled(self):
+        """Auto-select was cancelled: nothing changed"""
+        self._end_autoselect()
+        self.statusBar().showMessage("Auto-select cancelled, nothing was changed.")
+
+    def on_autoselect_failed(self, error: str):
+        """Auto-select failed: nothing changed"""
+        self._end_autoselect()
+        QtWidgets.QMessageBox.warning(self, "Auto-select", f"Auto-select failed, nothing was changed:\n{error}")
+
+    def on_autoselect_done(self, decisions: list[Decision]):
+        """Auto-select decided every group: make its plan the current one, and say what it is"""
+        self._end_autoselect()
+
+        # The plan replaces every MARKED and MOVE TO file (IGNORED ones are in self.ignored, so they stay)
+        self.file_states = {path: state for path, state in self.file_states.items()
+                            if state.state not in {SelectionState.MARK, SelectionState.MOVE}}
+        self.planned_moves = {}
+        for decision in decisions:
+            for path in decision.mark:
+                self.file_states[path] = SelectionValues.MARK
+            if decision.move:
+                self.file_states[decision.keep] = SelectionValues.MOVE
+                self.planned_moves[decision.keep] = decision.move
+        self._autoselect_plan = True
+        self._update_plan_buttons()
+        self.update_group_list()
+
+        decided = [d for d in decisions if not d.skip]
+        marked = sum(len(d.mark) for d in decided)
+        moves = sum(d.move is not None for d in decided)
+        skipped = {reason: sum(d.skip is reason for d in decisions) for reason in Skip}
+        left = sum(skipped.values())
+        self.statusBar().showMessage(f"Auto-select planned {len(decided):,} groups: {marked:,} MARKED, "
+                                     f"{moves:,} MOVE TO. Nothing has happened yet: press Apply to carry it out.")
+
+        text = f"Auto-select planned {len(decided):,} of {len(decisions):,} groups:\n\n"
+        text += f"    {marked:,} file(s) MARKED: they'll be deleted.\n"
+        if moves:
+            text += (f"    {moves:,} better copies MOVE TO a higher folder, in place of a copy there (which is"
+                     " MARKED). Hover over a MOVE TO picture to see where it goes, and its new name.\n")
+        text += "\n"
+        if left:
+            text += f"{left:,} group(s) were left for you to decide:\n"
+            text += "".join(f"    {count:,}: {reason.value}\n" for reason, count in skipped.items() if count)
+            text += "\n"
+        text += ("Nothing has happened to any file yet. You can change any picture first: click it to change it "
+                 "(a MOVE TO picture goes back to unselected), or right-click it for more.\n\n"
+                 "Press Apply to carry out the plan, or Clear plan to undo it. Delete and Move are off until then.")
+        QtWidgets.QMessageBox.information(self, "Auto-select", text)
     # endregion
 
     def process_file_states(self, action: "FileAction"):

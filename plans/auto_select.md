@@ -1,6 +1,6 @@
 # Auto-select
 
-Status: **building**. Steps 1 (measuring quality), 2 (the decision rules) and 3 (MOVE TO and Apply) are done. The Auto-select menu item and button exist but are disabled.
+Status: **working**. Steps 1-4 are done; step 5 (tuning on a real library) is next. 
 
 ## Goal
 
@@ -100,7 +100,11 @@ Settled 2026-10-20.
    replaces. Right-click "Replace a copy in another folder with this..." asks which copy if there are several. While a
    move is planned, Delete and Move are off and Apply and Clear plan show. Apply deletes the MARKED files first (so the
    replaced copy's name is free), then moves; a name still taken gets " (2)".
-4. Auto-select itself: warning, progress and Cancel, the summary dialog.
+4. Auto-select itself: warning, progress and Cancel, the summary dialog. **Done**: on once a scan is loaded (off while scanning or
+   regrouping). Asks first if anything is MARKED or MOVE TO. Decides a snapshot of every shown group on another
+   thread, with progress and Cancel (cancelling changes nothing). Then the plan replaces every MARKED and MOVE TO file,
+   and a summary says what's planned and which groups were left alone, and why. The plan waits for Apply or Clear plan
+   even when it has no moves.
 5. Tuning "clearly better" and the name check on your library. Seen so far: AI upscales (`...gigapixel-scale-2_00x.png`) win on
    pixels over their originals; and a 540x812 copy at JPEG quality 89 beat a 600x901 one at 73 (23% more pixels is
    under the 25% bar, so compression decided).
