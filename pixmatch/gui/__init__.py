@@ -17,7 +17,8 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from send2trash import send2trash
 
 from pixmatch import Finished, ImageMatcher, NewGroup, NewMatch, ZipPath, _is_under, has_image_outside_zips
-from pixmatch.autoselect import Candidate, Decision, Move, Skip, decide, folder_rank, moved_name
+from pixmatch.autoselect import Candidate, Decision, Move, Skip, check_detail, decide, folder_rank, moved_name
+from pixmatch.detail import differ_in_detail
 from pixmatch.gui.utils import MAX_SIZE_POLICY, NO_MARGIN
 from pixmatch.gui.widgets import (
     LISTED_MIME,
@@ -193,9 +194,14 @@ class AutoSelectSignals(QtCore.QObject):
 
 
 class AutoSelectThread(QtCore.QRunnable):
-    """Decides every group (see pixmatch.autoselect.decide) off of the GUI thread, from a snapshot of the groups"""
+    """
+    Decides every group (see pixmatch.autoselect.decide) off of the GUI thread, from a snapshot of the groups.
 
-    PROGRESS_EVERY = 500  # Groups between progress reports (and chances to cancel)
+    Each decision is then checked for copies that differ in detail (see pixmatch.autoselect.check_detail), which reads
+        the pictures: ~65-90ms a pair, so this is what takes the time.
+    """
+
+    PROGRESS_EVERY = 20  # Groups between progress reports (and chances to cancel)
 
     def __init__(self, groups: list[list[Candidate]]):
         super().__init__()
@@ -218,7 +224,7 @@ class AutoSelectThread(QtCore.QRunnable):
                         self.signals.cancelled.emit()
                         return
                     self.signals.progress.emit(i, total)
-                decisions.append(decide(group))
+                decisions.append(check_detail(decide(group), lambda a, b: differ_in_detail(a.path, b.path)))
         except Exception as e:
             logger.exception("Auto-select failed")
             self.signals.failed.emit(f"{type(e).__name__}: {e}")

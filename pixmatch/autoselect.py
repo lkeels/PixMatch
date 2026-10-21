@@ -10,7 +10,7 @@ import re
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path, PurePath
-from typing import Sequence
+from typing import Callable, Sequence
 
 from pixmatch import ImageQuality, ZipPath
 
@@ -39,6 +39,7 @@ class Skip(Enum):
     ANIMATED = "it has an animation"
     COLOUR_CONFLICT = "the best copy is black and white, but there's a colour copy"
     TOO_CLOSE = "no copy is clearly better, and nothing else decides between them"
+    DIFFERENT_DETAIL = "the copies differ in a patch of detail (text, a caption or watermark, or a different version)"
 
 
 @dataclass(frozen=True)
@@ -319,3 +320,25 @@ def decide(group: Sequence[Candidate]) -> Decision:
         move=Move(replaced.path, Path(replaced.path.path).parent, moved_name(keeper.path, replaced.path)),
         reason=reason,
     )
+
+
+def check_detail(decision: Decision, differ: Callable[[ZipPath, ZipPath], bool]) -> Decision:
+    """
+    The safety net: leave a group alone if a copy that would be deleted differs from the one kept in a patch of fine
+        detail (see pixmatch.detail), like disc labels that differ only by their text. Those match at any strength,
+        and so does a copy with a watermark added: which is which can't be told, so the user decides.
+
+    Args:
+        decision (Decision): What decide planned for the group.
+        differ (Callable[[ZipPath, ZipPath], bool]): Whether two copies differ in detail (pixmatch.detail).
+
+    Returns:
+        Decision: The same decision, or one leaving the group alone (Skip.DIFFERENT_DETAIL).
+    """
+    if decision.skip or decision.keep is None:
+        return decision
+
+    if any(differ(decision.keep, marked) for marked in decision.mark):
+        return Decision(skip=Skip.DIFFERENT_DETAIL)
+
+    return decision

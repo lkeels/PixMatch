@@ -38,6 +38,13 @@ listed parent). Higher in the folder list is higher priority for keeping, but it
    4. Bigger file.
    5. Still tied: exact copies in the same folder keep one (see Decisions, 2); otherwise the group is left alone.
 5. Groups with an animated image are left alone (as in VisDeDupe: too ambiguous to decide automatically).
+6. **Safety net:** a group is left alone if a copy that would be deleted differs from the one kept in a patch of fine
+   detail (`pixmatch/detail.py`, compared at up to 256 pixels once lined up). Disc labels that differ only by their
+   text (the four Voyager discs) match at every strength, here and in VisiPics, and so does a copy with a watermark or
+   caption added. Nothing can tell those apart, so the user decides both. Measured: the discs 0.44-0.49, their
+   resized, recompressed, brightened, mirrored, turned or 1%-cropped copies at most 0.36; the line is 0.40. On real
+   strict-level pairs about half are left alone this way (mostly watermarked, recaptioned or recropped copies). It
+   reads the pictures, ~65-90ms a pair.
 
 ### Names of moved files
 
