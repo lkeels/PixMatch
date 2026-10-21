@@ -17,6 +17,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from send2trash import send2trash
 
 from pixmatch import Finished, ImageMatcher, NewGroup, NewMatch, ZipPath, _is_under, has_image_outside_zips
+from pixmatch.autoselect import Move, moved_name
 from pixmatch.gui.utils import MAX_SIZE_POLICY, NO_MARGIN
 from pixmatch.gui.widgets import (
     LISTED_MIME,
@@ -207,6 +208,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.processor = None
         # MARK (and KEEP) states of files. Ignored files are in self.ignored instead, which is saved between runs
         self.file_states = {}
+        # The files planned to move (MOVE in file_states) -> where to (see plan_move). A plan is carried out by Apply
+        self.planned_moves: dict[ZipPath, Move] = {}
         self.ignored = IgnoredImages()
         self._threadpool = QtCore.QThreadPool()
 
@@ -385,9 +388,18 @@ class MainWindow(QtWidgets.QMainWindow):
         run_move.triggered.connect(self.on_move)
         run_delete = QtGui.QAction("Delete", self)
         run_delete.triggered.connect(self.on_delete)
+        # While a plan is waiting (files planned to move), it's carried out with Apply, and Delete and Move are off
+        self._run_apply = QtGui.QAction("Apply plan", self, visible=False)
+        self._run_apply.triggered.connect(self.apply_plan)
+        self._run_clear_plan = QtGui.QAction("Clear plan", self, visible=False)
+        self._run_clear_plan.triggered.connect(self.clear_plan)
+        self._delete_move_actions = [run_move, run_delete]
+
         actions_menu = menu.addMenu("&Actions")
         actions_menu.addAction(run_move)
         actions_menu.addAction(run_delete)
+        actions_menu.addAction(self._run_apply)
+        actions_menu.addAction(self._run_clear_plan)
         # endregion
 
         # region Options menu
@@ -448,9 +460,19 @@ class MainWindow(QtWidgets.QMainWindow):
         delete_btn = QtWidgets.QPushButton("Delete")
         delete_btn.pressed.connect(self.on_delete)
 
+        self._apply_btn = QtWidgets.QPushButton("Apply", visible=False)
+        self._apply_btn.setToolTip("Carry out the plan: move the MOVE TO files, and delete the MARKED ones")
+        self._apply_btn.pressed.connect(self.apply_plan)
+        self._clear_plan_btn = QtWidgets.QPushButton("Clear plan", visible=False)
+        self._clear_plan_btn.setToolTip("Un-select every MOVE TO and MARKED file")
+        self._clear_plan_btn.pressed.connect(self.clear_plan)
+        self._delete_move_buttons = [move_btn, delete_btn]
+
         actions = QtWidgets.QVBoxLayout()
         actions.addWidget(move_btn)
         actions.addWidget(delete_btn)
+        actions.addWidget(self._apply_btn)
+        actions.addWidget(self._clear_plan_btn)
 
         actions_box = QtWidgets.QGroupBox("Actions")
         actions_box.setLayout(actions)
@@ -905,6 +927,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._page_seq = 0  # The next scan's events are numbered from the start again
         self._regroup_failed = False
         self.file_states = {}
+        self.planned_moves = {}
+        self._update_plan_buttons()
         self.current_page = 1
         self._page_starts = [0]
         self._shown_from = 0
@@ -1312,12 +1336,16 @@ class MainWindow(QtWidgets.QMainWindow):
         """Set the state of several files, see set_file_state"""
         ignore, unignore = [], []
         for path in paths:
+            if state.state != SelectionState.MOVE:
+                self.planned_moves.pop(path, None)
+
             if state.state == SelectionState.IGNORE:
                 self.file_states.pop(path, None)
                 ignore.append(path)
                 continue
 
-            if state.state == SelectionState.MARK and (path.is_zip or not self._has_duplicate(path)):
+            if (state.state in {SelectionState.MARK, SelectionState.MOVE}
+                    and (path.is_zip or not self._has_duplicate(path))):
                 continue
 
             self.file_states[path] = state
@@ -1326,6 +1354,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.ignored.add(ignore)
         self.ignored.discard(unignore)
+        self._update_plan_buttons()
         if self.processor and (ignore or unignore) and not self.show_ignored_option.isChecked():
             # Groups that are all ignored now are hidden (and ones that aren't anymore are shown)
             before = len(self.processor.matches)
@@ -1343,8 +1372,11 @@ class MainWindow(QtWidgets.QMainWindow):
         with self.processor.paused():
             self.file_states = {
                 path: state for path, state in self.file_states.items()
-                if state.state != SelectionState.MARK or self._has_duplicate(path)
+                if state.state not in {SelectionState.MARK, SelectionState.MOVE} or self._has_duplicate(path)
             }
+            self.planned_moves = {path: move for path, move in self.planned_moves.items() if path in self.file_states}
+
+        self._update_plan_buttons()
 
     def _has_duplicate(self, path: ZipPath) -> bool:
         """Is this file in a match group?"""
@@ -1413,6 +1445,7 @@ class MainWindow(QtWidgets.QMainWindow):
             TileAction.KEEP_DELETE_OTHERS: self.keep_this_delete_others,
             TileAction.MOVE_LEAVE_OTHERS: lambda p: self.move_this(p, delete_others=False),
             TileAction.MOVE_DELETE_OTHERS: lambda p: self.move_this(p, delete_others=True),
+            TileAction.REPLACE: self.replace_with_this,
         }
         handlers[action](path)
 
@@ -1521,6 +1554,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _forget(self, path: ZipPath):
         """Take a file that was moved or deleted out of the results, along with any marking and preview it had"""
         self.file_states.pop(path, None)
+        self.planned_moves.pop(path, None)
         self.ignored.discard([path])
         self.image_view_area.forget(path)
         with self.processor.paused():
@@ -1611,6 +1645,13 @@ class MainWindow(QtWidgets.QMainWindow):
                     set_state = SelectionValues.IGNORE
                 if set_state:
                     tile.silent_set_state(set_state)
+
+                # Hovering a MOVE TO tile says where it goes
+                move = self.planned_moves.get(tile.path)
+                tile.setToolTip(
+                    f"Moves to {move.folder}\nas {move.name}\nin place of {Path(move.replaces.path).name} (MARKED)"
+                    if move and set_state == SelectionValues.MOVE else "",
+                )
 
     # region File Path Selection display
     def build_file_path_selection_display(self):
@@ -1803,23 +1844,178 @@ class MainWindow(QtWidgets.QMainWindow):
         return file_size
 
     @staticmethod
-    def move_file(source: Path, folder: Path) -> Path:
+    def move_file(source: Path, folder: Path, name: str | None = None) -> Path:
         """
-        Move a file into a folder. It never replaces a file: if the name is taken, it gets " (2)", " (3)"... added.
+        Move a file into a folder, keeping its name or with a new one. It never replaces a file: if the name is taken,
+            it gets " (2)", " (3)"... added.
 
         Returns:
             Path: Where the file was moved to.
         """
-        destination = folder / source.name
+        name = Path(name or source.name)
+        destination = folder / name
         number = 2
         while destination.exists():
-            destination = folder / f"{source.stem} ({number}){source.suffix}"
+            destination = folder / f"{name.stem} ({number}){name.suffix}"
             number += 1
 
         folder.mkdir(parents=True, exist_ok=True)
         logger.info("Moving %s to %s", source, destination)
         shutil.move(str(source), str(destination))
         return destination
+
+    # region Plans (MOVE TO), see plans/auto_select.md
+    def plan_move(self, path: ZipPath, move: Move):
+        """
+        Plan to move a file into another copy's folder, in its place: the file shows MOVE TO and the copy it replaces
+            is MARKED. Nothing happens until the plan is applied (apply_plan).
+        """
+        self._set_file_states([path], SelectionValues.MOVE)
+        if self.file_states.get(path) != SelectionValues.MOVE:
+            return  # It can't be (it's in a zip, or has no duplicate)
+
+        self.planned_moves[path] = move
+        self._set_file_states([move.replaces], SelectionValues.MARK)
+        self.update_selection_states()
+
+    def plan_waiting(self) -> bool:
+        """Is a plan waiting to be applied (are any files planned to move)?"""
+        return bool(self.planned_moves)
+
+    def _update_plan_buttons(self):
+        """While a plan is waiting, Apply and Clear plan take the place of Delete and Move"""
+        waiting = self.plan_waiting()
+        for widget in (*self._delete_move_buttons, *self._delete_move_actions):
+            widget.setEnabled(not waiting)
+        for widget in (self._apply_btn, self._clear_plan_btn, self._run_apply, self._run_clear_plan):
+            widget.setVisible(waiting)
+
+    def replace_with_this(self, path: ZipPath):
+        """
+        Plan to move a file into another copy's folder in place of that copy (right click "Replace a copy in another
+            folder with this"). If there are copies in more than one other folder, ask which one.
+        """
+        folder = Path(path.path).parent
+        others = [p for p in self._group_others(path) if not p.is_zip and Path(p.path).parent != folder]
+        if not others:
+            QtWidgets.QMessageBox.information(self, "Replace", "There's no copy in another folder to replace.")
+            return
+
+        replaced = others[0] if len(others) == 1 else self._choose_copy(others)
+        if replaced is None:
+            return
+
+        self.plan_move(path, Move(replaced, Path(replaced.path).parent, moved_name(path, replaced)))
+
+    def _choose_copy(self, copies: list[ZipPath]) -> ZipPath | None:
+        """
+        Ask which copy to replace, with a menu at the mouse.
+
+        Returns:
+            ZipPath | None: The copy chosen, or None if the menu was closed.
+        """
+        menu = QtWidgets.QMenu(self)
+        for copy in copies:
+            menu.addAction(f"{Path(copy.path).name}   in   {Path(copy.path).parent}").setData(copy)
+        chosen = menu.exec(QtGui.QCursor.pos())
+        return None if chosen is None else chosen.data()
+
+    def clear_plan(self):
+        """Un-select every file planned to move, and every marked one"""
+        planned = [p for p, state in self.file_states.items()
+                   if state.state in {SelectionState.MARK, SelectionState.MOVE}]
+        if planned and not self.confirm("Clear plan?", f"Un-select {len(planned)} MOVE TO and MARKED file(s)?"):
+            return
+
+        self.file_states = {p: s for p, s in self.file_states.items() if p not in planned}
+        self.planned_moves = {}
+        self._update_plan_buttons()
+        if self.processor:
+            self.update_group_list()
+
+    def apply_plan(self):
+        """
+        Carry out the plan, after asking: delete the MARKED files, then move each MOVE TO file into its folder in place
+            of the copy it replaces (which was MARKED, so it's gone and its name is free).
+
+        A move never replaces a file (see move_file). Files that can't be moved or deleted are left as they are.
+        """
+        if not self.processor:
+            return
+
+        delete = [p for p, state in self.file_states.items() if state.state == SelectionState.MARK and not p.is_zip]
+        moves = [(p, m) for p, m in self.planned_moves.items() if self.file_states.get(p) == SelectionValues.MOVE]
+        if not delete and not moves:
+            QtWidgets.QMessageBox.information(self, "Apply", "Nothing is planned.")
+            return
+
+        where = "to the Recycle Bin" if self.recycle else "permanently"
+        text = ""
+        if moves:
+            text += f"Move {len(moves)} file(s) into other folders, in place of the copies there:\n"
+            text += "".join(f"    {Path(p.path).name}  →  {m.folder / m.name}\n" for p, m in moves[:10])
+            text += f"    ...and {len(moves) - 10} more\n" if len(moves) > 10 else ""
+            text += "\n"
+        text += f"Delete {len(delete)} MARKED file(s) {where}"
+        text += ", including the copies being replaced.\n" if moves else ".\n"
+        text += "".join(f"    {Path(p.path).name}\n" for p in delete[:10])
+        text += f"    ...and {len(delete) - 10} more\n" if len(delete) > 10 else ""
+        if not self.confirm("Apply plan?", text):
+            return
+
+        is_paused = self.processor.conditional_pause()
+        self.image_view_area.clear()
+        # Previews and thumbnails are read in the background with their files open, and Windows won't delete or move an
+        #   open file
+        self.image_view_area.release_files()
+        self.duplicate_group_list.release_files()
+        deleted = deleted_size = moved = renamed = 0
+        failed = []
+        try:
+            with self.processor.paused():
+                for path in delete:
+                    try:
+                        deleted_size += self.delete_file(path.path_obj)
+                        deleted += 1
+                    except FileNotFoundError:
+                        logger.info("File already deleted: %s", path)
+                    except OSError as e:
+                        logger.warning("Failed to delete %s: %s", path, e)
+                        failed.append(f"{path.path_obj.name}: {e}")
+                        continue
+                    self._forget(path)
+
+                for path, move in moves:
+                    try:
+                        destination = self.move_file(path.path_obj, move.folder, move.name)
+                    except OSError as e:
+                        logger.warning("Failed to move %s to %s: %s", path, move.folder, e)
+                        failed.append(f"{path.path_obj.name}: {e}")
+                        continue
+                    moved += 1
+                    renamed += destination.name != move.name
+                    self.file_states.pop(path, None)
+                    self.planned_moves.pop(path, None)
+                    self.image_view_area.forget(path)
+                    if any(_is_under(f, destination) for f in self.file_paths_selected()):
+                        self.processor.rename(path, ZipPath(str(destination)))
+                    elif path in self.processor._reverse_hashes:
+                        self.processor.remove(path)
+        finally:
+            self.deleted_files_count += deleted
+            self.deleted_files_size += deleted_size
+            self._update_plan_buttons()
+            self.update_labels()
+            self.update_group_list()
+            self.processor.conditional_resume(is_paused)
+
+        result = f"Moved {moved} file(s) into their folders.\n" if moves else ""
+        result += f"{renamed} of them got \" (2)\" added, since the name was still taken.\n" if renamed else ""
+        result += f"Deleted {deleted} file(s), {human_bytes(deleted_size)}.\n"
+        if failed:
+            result += "\nCouldn't do these (they're left as they were):\n" + "\n".join(failed[:20])
+        QtWidgets.QMessageBox.information(self, "Plan applied", result)
+    # endregion
 
     def process_file_states(self, action: "FileAction"):
         """

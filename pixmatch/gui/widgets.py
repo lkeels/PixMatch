@@ -39,11 +39,13 @@ class SelectionState(Enum):
     Per-thumbnail action state.
 
     The Delete and Move actions act on every MARK file. IGNORE is saved straight away, and a group whose files are all
-        IGNORE is hidden (see pixmatch.ignored).
+        IGNORE is hidden (see pixmatch.ignored). MOVE is part of a plan (from Auto-select, or "Replace a copy in another
+        folder with this"): the file moves into another copy's folder in its place, when the plan is applied.
     """
     KEEP = 'keep'
     MARK = 'mark'
     IGNORE = 'ignore'
+    MOVE = 'move'
 
 
 @dataclass(frozen=True)
@@ -57,6 +59,7 @@ class SelectionValues:
     KEEP = SelectionValue(SelectionState.KEEP)
     MARK = SelectionValue(SelectionState.MARK)
     IGNORE = SelectionValue(SelectionState.IGNORE)
+    MOVE = SelectionValue(SelectionState.MOVE)  # Only set with the move it's for, see MainWindow.plan_move
 
 
 class TileAction:
@@ -68,6 +71,7 @@ class TileAction:
     KEEP_DELETE_OTHERS = "keep_delete_others"
     MOVE_LEAVE_OTHERS = "move_leave_others"
     MOVE_DELETE_OTHERS = "move_delete_others"
+    REPLACE = "replace"
 
 
 STATE_ORDER = [SelectionValues.KEEP, SelectionValues.MARK, SelectionValues.IGNORE]
@@ -82,6 +86,8 @@ class StateBannerStyle:
     tint: QtGui.QColor
 
 
+# Clicking a tile cycles through these. A MOVE tile goes back to KEEP: only a plan sets MOVE, with where it moves to
+
 # Keeping a file has no banner, so the thumbnail shows as is
 STATE_BANNERS = {
     SelectionState.MARK: StateBannerStyle(
@@ -89,6 +95,9 @@ STATE_BANNERS = {
     ),
     SelectionState.IGNORE: StateBannerStyle(
         "IGNORED", QtGui.QColor(55, 55, 55, 215), QtGui.QColor(225, 225, 225), QtGui.QColor(0, 0, 0, 110),
+    ),
+    SelectionState.MOVE: StateBannerStyle(
+        "MOVE TO", QtGui.QColor(25, 90, 170, 220), QtGui.QColor(225, 238, 255), QtGui.QColor(30, 100, 190, 60),
     ),
 }
 
@@ -1127,6 +1136,7 @@ class ThumbnailTile(QtWidgets.QFrame):
         add("Mark", lambda: self.change_state_clicked(SelectionValues.MARK), enabled=not in_zip)
         add("Ignore", lambda: self.change_state_clicked(SelectionValues.IGNORE))
         add("Un-select", lambda: self.change_state_clicked(SelectionValues.KEEP))
+        add("Replace a copy in another folder with this...", emit(TileAction.REPLACE), enabled=not in_zip)
         menu.addSeparator()
         add("Ignore group", emit(TileAction.IGNORE_GROUP))
         add("Un-select group", emit(TileAction.UNMARK_GROUP))
@@ -1187,7 +1197,7 @@ class ThumbnailTile(QtWidgets.QFrame):
             return
 
         locked = bool(self._path.subpath)
-        if locked and state.state == SelectionState.MARK:
+        if locked and state.state in {SelectionState.MARK, SelectionState.MOVE}:
             raise ValueError(f"Cannot set a locked file to the {state.state.value} state!")
 
         self._state = state
@@ -1198,7 +1208,11 @@ class ThumbnailTile(QtWidgets.QFrame):
         self.state = state
 
     def cycle_state(self):
-        """Advance KEEP → MARK → IGNORE → KEEP."""
+        """Advance KEEP → MARK → IGNORE → KEEP. A MOVE tile goes back to KEEP (only a plan sets MOVE)."""
+        if self._state not in STATE_ORDER:
+            self.state = SelectionValues.KEEP
+            return
+
         idx = STATE_ORDER.index(self._state)
         locked = bool(self._path.subpath)
         next_state = STATE_ORDER[(idx + 1) % len(STATE_ORDER)]

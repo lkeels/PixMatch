@@ -1,6 +1,6 @@
 # Auto-select
 
-Status: **building**. Steps 1 (measuring quality) and 2 (the decision rules) are done. The Auto-select menu item and button exist but are disabled.
+Status: **building**. Steps 1 (measuring quality), 2 (the decision rules) and 3 (MOVE TO and Apply) are done. The Auto-select menu item and button exist but are disabled.
 
 ## Goal
 
@@ -96,7 +96,10 @@ Settled 2026-10-20.
    kept copy up into its place when several copies tie. Tried on T, B and Unsorted (113,691 images, 380 groups at
    Basic): 314 kept with the rest marked, 2 moves (both right), 49 colour conflicts (47 truly grey), 15 animated.
 3. MOVE TO: the state, its banner and hover, Apply carrying out deletes and replacements, and the right-click
-   "Replace...".
+   "Replace...". **Done**: a blue MOVE TO banner, hovering shows the folder, name and the copy it
+   replaces. Right-click "Replace a copy in another folder with this..." asks which copy if there are several. While a
+   move is planned, Delete and Move are off and Apply and Clear plan show. Apply deletes the MARKED files first (so the
+   replaced copy's name is free), then moves; a name still taken gets " (2)".
 4. Auto-select itself: warning, progress and Cancel, the summary dialog.
 5. Tuning "clearly better" and the name check on your library. Seen so far: AI upscales (`...gigapixel-scale-2_00x.png`) win on
    pixels over their originals; and a 540x812 copy at JPEG quality 89 beat a 600x901 one at 73 (23% more pixels is
